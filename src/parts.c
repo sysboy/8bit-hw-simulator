@@ -55,10 +55,6 @@ void part_set_type(sim_t *s, int part, const part_type_t *t) {
     free(copy);
 }
 
-unsigned part_read_bus(sim_t *s, part_t *p, const int *pins, int n) {
-    return sim_read_group(s, p, pins, n);
-}
-
 void part_drive_bus(sim_t *s, part_t *p, const int *pins, int n, unsigned v, bool enable) {
     for (int i = 0; i < n; i++)
         pin_out(s, p, pins[i], enable ? DRV_BIT((v >> i) & 1) : DRV_Z);
