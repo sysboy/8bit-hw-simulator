@@ -435,26 +435,33 @@ drive_t pin_drive(const sim_t *s, const pin_t *p) {
 /* Resolve a root net. If its level or "drivenness" changed, every part that
  * reads it must be re-evaluated. 'cause_part' is the part whose drive just
  * changed: analog switches don't need to look at their own drive. */
-static void resolve(sim_t *s, int root, int cause_part) {
-    net_t *n = &s->nets[root];
-    int contention;
-    drive_t d = sim_combine(n->kinds, &contention);
-    int st = d >> 1;
-    /* A floating net keeps its level (the charge on the copper). */
-    int level = st == S_Z ? n->level : (d & 1);
-    n->contention = contention;
+static inline void resolve_net(sim_t *s, net_t *n, int root, unsigned kinds, int cause_part) {
+    int st, level, contention;
+    if (__builtin_expect(kinds >= (1u << DRIVE(S_STRONG, 0)) && kinds < (1u << DRIVE(S_SUPPLY, 0)), 1)) {
+        st = S_STRONG;
+        level = !(kinds & (1u << DRIVE(S_STRONG, 0)));
+        contention = (kinds & (3u << DRIVE(S_STRONG, 0))) == (3u << DRIVE(S_STRONG, 0));
+    } else {
+        drive_t d = sim_combine(kinds, &contention);
+        st = d >> 1;
+        /* A floating net keeps its level (the charge on the copper). */
+        level = st == S_Z ? n->level : (d & 1);
+    }
+    n->contention = (uint8_t)contention;
     /* An analog switch passes the other drivers through: it must look again
      * whenever any of them changes, even if the resulting level doesn't. */
-    for (int i = 0; i < n->nswitches; i++)
-        if (n->switches[i] != cause_part) sim_mark_dirty(s, n->switches[i]);
-    if (level == n->level && (st == S_Z) == (n->strength == S_Z)) { n->strength = st; return; }
+    if (__builtin_expect(n->nswitches != 0, 0)) {
+        for (int i = 0; i < n->nswitches; i++)
+            if (n->switches[i] != cause_part) sim_mark_dirty(s, n->switches[i]);
+    }
+    if (level == n->level && (st == S_Z) == (n->strength == S_Z)) { n->strength = (uint8_t)st; return; }
     if (st == S_Z && n->strength != S_Z) {      /* nobody drives it anymore */
         n->float_since = s->cycle;
-        n->level = level;
+        n->level = (uint8_t)level;
         set_hold(s, n);
     }
-    n->level = level;
-    n->strength = st;
+    n->level = (uint8_t)level;
+    n->strength = (uint8_t)st;
     s->changes++;
     /* Keep the dense copies used by sim_read() and sim_read_group(). */
     int floating = st == S_Z;
@@ -470,15 +477,32 @@ static void resolve(sim_t *s, int root, int cause_part) {
     for (int i = 0; i < n->nreaders; i++) sim_mark_dirty(s, n->readers[i]);
 }
 
+static void resolve(sim_t *s, int root, int cause_part) {
+    net_t *n = &s->nets[root];
+    resolve_net(s, n, root, n->kinds, cause_part);
+}
+
 /* Slow path of sim_drive(): the drive of an unlocked pin changed. */
 void sim_drive_changed(sim_t *s, pin_t *p) {
-    drive_t eff = p->drive;
-    if (eff == p->eff) return;
-    net_t *n = &s->nets[p->root];
-    if (p->eff >> 1) count_sub(n, p->eff);
-    if (eff >> 1) count_add(n, eff);
+    drive_t old_eff = p->eff, eff = p->drive;
+    if (eff == old_eff) return;
     p->eff = eff;
-    resolve(s, p->root, p->part);
+    int root = p->root;
+    net_t *n = &s->nets[root];
+    unsigned old_kinds = n->kinds, kinds = old_kinds;
+    if ((old_eff >> 1) && --n->count[old_eff] == 0) kinds &= ~(1u << old_eff);
+    if ((eff >> 1) && n->count[eff]++ == 0) kinds |= 1u << eff;
+    n->kinds = (uint16_t)kinds;
+    if ((kinds ^ old_kinds) < (1u << DRIVE(S_STRONG, 0)) &&
+        (kinds >= (1u << DRIVE(S_STRONG, 0)) || kinds == old_kinds)) {
+        if (__builtin_expect(n->nswitches != 0, 0)) {
+            int cause = p->part;
+            for (int i = 0; i < n->nswitches; i++)
+                if (n->switches[i] != cause) sim_mark_dirty(s, n->switches[i]);
+        }
+        return;
+    }
+    resolve_net(s, n, root, kinds, p->part);
 }
 
 void sim_set_pin_fault(sim_t *s, int pin, int fault) {
