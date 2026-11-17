@@ -94,6 +94,11 @@ typedef struct {
     uint8_t row, col;
     uint8_t ras_prev, cas_prev;
     uint8_t out_en, out_bit;
+    uint32_t bank_epoch;
+    int8_t bank_n;          /* >0: bank leader; -1: bank follower; 0: standalone */
+    int16_t bank_parts[8];
+    int16_t pin_d[8], pin_q[8];
+    int16_t pin_ras, pin_cas, pin_we;
 } dram_state_t;
 /* 64K x 4 DRAM: one nibble per cell. */
 typedef struct {
@@ -133,7 +138,16 @@ typedef struct { bool crystal_ok; } vco_state_t;
  *   ANALOG           not simulated */
 enum { EL_PULLUP, EL_PULLDOWN, EL_LINK, EL_ANALOG, EL_SERIES, EL_DIODE, EL_DELAY, EL_NPN, EL_FOLLOWER };
 typedef struct { int pin_a, pin_b, type; } element_t;
-typedef struct { element_t el[16]; int nel; uint8_t delayed[16]; } resistor_state_t;
+typedef struct {
+    element_t el[16];
+    int nel;
+    uint8_t delayed[16];
+    uint32_t epoch;
+    uint8_t off;
+    uint8_t nbank;
+    int16_t bank_parts[16];
+    int16_t bank_a[16], bank_b[16];
+} resistor_state_t;
 void resistor_eval(sim_t *s, part_t *p);
 void resistor_commit(sim_t *s, part_t *p);
 /* Make an element one of the active kinds above (sets pin flags, eval and

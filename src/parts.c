@@ -303,8 +303,67 @@ static const int dram_addr_pins[8] = { 5, 7, 6, 12, 11, 10, 13, 9 };
 
 /* Everything a DRAM does happens on the edges of /RAS and /CAS, so the
  * work is in commit(); eval() just drives Q (pin 14) during a read. */
+static bool dram_part_clean(const sim_t *s, const part_t *p) {
+    if (p->dead || p->mfault != MF_OK || p->supply_weak) return false;
+    for (int k = 0; k < p->npins; k++)
+        if (s->pins[p->first_pin + k].fault != PF_OK) return false;
+    return true;
+}
+
+static bool dram_same_bus(const sim_t *s, const part_t *a, const part_t *b, int bits) {
+    static const int ctrl[3] = { 4, 15, 3 };    /* /RAS, /CAS, /WE */
+    for (int i = 0; i < 3; i++) {
+        int pa = part_pin(a, ctrl[i]), pb = part_pin(b, ctrl[i]);
+        if (pa < 0 || pb < 0 || s->pins[pa].root < 0 || s->pins[pa].root != s->pins[pb].root)
+            return false;
+    }
+    for (int i = 0; i < bits; i++) {
+        int pa = part_pin(a, dram_addr_pins[i]), pb = part_pin(b, dram_addr_pins[i]);
+        if (pa < 0 || pb < 0 || s->pins[pa].root < 0 || s->pins[pa].root != s->pins[pb].root)
+            return false;
+    }
+    return true;
+}
+
+static void dram_bank_setup(sim_t *s, part_t *p, int bits) {
+    dram_state_t *st = p->state;
+    st->bank_epoch = s->epoch;
+    st->bank_n = 0;
+    if (!dram_part_clean(s, p)) return;
+    int n = 0;
+    for (int i = 0; i < s->nparts && n < 8; i++) {
+        part_t *q = &s->parts[i];
+        if (q->commit != p->commit || !dram_part_clean(s, q)) continue;
+        if (q != p && !dram_same_bus(s, p, q, bits)) continue;
+        dram_state_t *qst = q->state;
+        if (q != p && qst->bank_epoch == s->epoch && qst->bank_n != 0) continue;
+        st->bank_parts[n] = (int16_t)i;
+        st->pin_d[n] = (int16_t)part_pin(q, 2);
+        st->pin_q[n] = (int16_t)part_pin(q, 14);
+        n++;
+    }
+    if (n <= 1) return;
+    st->bank_n = (int8_t)n;
+    st->pin_ras = (int16_t)part_pin(p, 4);
+    st->pin_cas = (int16_t)part_pin(p, 15);
+    st->pin_we = (int16_t)part_pin(p, 3);
+    for (int k = 1; k < n; k++) {
+        dram_state_t *qst = s->parts[st->bank_parts[k]].state;
+        qst->bank_epoch = s->epoch;
+        qst->bank_n = -1;
+    }
+}
+
 static void dram_eval(sim_t *s, part_t *p) {
     dram_state_t *st = p->state;
+    if (st->bank_epoch == s->epoch && st->bank_n > 0) {
+        int n = st->bank_n;
+        for (int k = 0; k < n; k++) {
+            dram_state_t *kst = s->parts[st->bank_parts[k]].state;
+            sim_drive(s, st->pin_q[k], kst->out_en ? DRV_BIT(kst->out_bit) : DRV_Z);
+        }
+        return;
+    }
     pin_out(s, p, 14, st->out_en ? DRV_BIT(st->out_bit) : DRV_Z);
 }
 
@@ -320,7 +379,60 @@ enum {
 };
 static void dram_cycle(sim_t *s, part_t *p, int bits, int half) {
     dram_state_t *st = p->state;
+    if (__builtin_expect(st->bank_epoch != s->epoch, 0)) dram_bank_setup(s, p, bits);
+    if (st->bank_n < 0) return;
+    if (__builtin_expect(st->bank_n > 0, 1)) {
+        int ras = sim_read(s, st->pin_ras), cas = sim_read(s, st->pin_cas);
+        if (ras == st->ras_prev && cas == st->cas_prev) return;
+        int n = st->bank_n;
+        bool dirty = false;
+        if (st->ras_prev && !ras) {
+            uint8_t row = (uint8_t)part_read_bus(s, p, dram_addr_pins, bits);
+            for (int k = 0; k < n; k++)
+                ((dram_state_t *)s->parts[st->bank_parts[k]].state)->row = row;
+        }
+        if (st->cas_prev && !cas && !ras) {
+            uint8_t col = (uint8_t)part_read_bus(s, p, dram_addr_pins, bits);
+            int cell = (st->row << 8) | col;
+            bool bad = half == HALF_ROW7_LOW ? (st->row & 0x80) : half == HALF_ROW7_HIGH ? !(st->row & 0x80) :
+                       half == HALF_COL7_LOW ? (col & 0x80) : half == HALF_COL7_HIGH ? !(col & 0x80) : false;
+            if (!sim_read(s, st->pin_we)) {
+                for (int k = 0; k < n; k++) {
+                    dram_state_t *kst = s->parts[st->bank_parts[k]].state;
+                    kst->col = col;
+                    if (!bad) kst->cells[cell] = (uint8_t)sim_read(s, st->pin_d[k]);
+                    if (kst->out_en) { kst->out_en = 0; dirty = true; }
+                }
+            } else {
+                uint8_t bad_bit = (uint8_t)(((unsigned)cell * 2654435761u) >> 31);
+                for (int k = 0; k < n; k++) {
+                    dram_state_t *kst = s->parts[st->bank_parts[k]].state;
+                    kst->col = col;
+                    uint8_t bit = bad ? bad_bit : kst->cells[cell];
+                    if (!kst->out_en || kst->out_bit != bit) {
+                        kst->out_en = 1;
+                        kst->out_bit = bit;
+                        dirty = true;
+                    }
+                }
+            }
+        }
+        if (cas) {
+            for (int k = 0; k < n; k++) {
+                dram_state_t *kst = s->parts[st->bank_parts[k]].state;
+                if (kst->out_en) { kst->out_en = 0; dirty = true; }
+            }
+        }
+        for (int k = 0; k < n; k++) {
+            dram_state_t *kst = s->parts[st->bank_parts[k]].state;
+            kst->ras_prev = (uint8_t)ras;
+            kst->cas_prev = (uint8_t)cas;
+        }
+        if (dirty) sim_mark_dirty(s, (int)(p - s->parts));
+        return;
+    }
     int ras = pin_in(s, p, 4), cas = pin_in(s, p, 15);
+    if (ras == st->ras_prev && cas == st->cas_prev) return;
     uint8_t out_en = st->out_en, out_bit = st->out_bit;
     /* A dead address line inside the chip is dead for the row and the
      * column alike: they come in through the same buffer. */
@@ -537,12 +649,73 @@ const part_type_t PT_MC4044 = { "MC4044 PLL",
 /* What a series resistor passes from one side to the other: the drive on
  * that side (its own drive excluded), one step weaker. Through two
  * resistors a chip output is only as strong as a pull-up. */
+static inline drive_t through_fast(const net_t *n, drive_t eff) {
+    unsigned kinds = n->kinds;
+    if (kinds >= (1u << DRIVE(S_STRONG, 0)) && kinds < (1u << DRIVE(S_SUPPLY, 0)) && eff < DRIVE(S_STRONG, 0))
+        return DRIVE(S_RES, !(kinds & (1u << DRIVE(S_STRONG, 0))));
+    if ((eff >> 1) && n->count[eff] == 1) kinds &= ~(1u << eff);
+    if (!kinds) return DRV_Z;
+    int st = (31 - __builtin_clz(kinds)) >> 1;
+    return DRIVE(st >= S_STRONG ? S_RES : S_PULL, !(kinds & (1u << DRIVE(st, 0))));
+}
+
 static drive_t through(sim_t *s, int pin) {
-    drive_t d = sim_drive_others(s, pin);
-    int st = d >> 1;
-    if (st >= S_STRONG) return DRIVE(S_RES, d & 1);
-    if (st >= S_PULL) return DRIVE(S_PULL, d & 1);
-    return DRV_Z;
+    const pin_t *p = &s->pins[pin];
+    if (p->root < 0 || p->fault == PF_OPEN) return DRV_Z;
+    return through_fast(&s->nets[p->root], p->eff);
+}
+
+static void series_eval(sim_t *s, part_t *p);
+
+static void series_bank_setup(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    st->epoch = s->epoch;
+    st->off = p->rfault != RF_OK || a->root < 0 || b->root < 0 || a->root == b->root ||
+              a->fault == PF_OPEN || b->fault == PF_OPEN;
+    st->nbank = 0;
+    if (st->off) return;
+    for (int i = 0; i < s->nparts && st->nbank < 16; i++) {
+        part_t *q = &s->parts[i];
+        if (q == p || q->eval != series_eval || q->dead || q->rfault != RF_OK) continue;
+        resistor_state_t *qst = q->state;
+        const element_t *qe = &qst->el[0];
+        const pin_t *qa = &s->pins[qe->pin_a], *qb = &s->pins[qe->pin_b];
+        if (qa->root < 0 || qb->root < 0 || qa->root == qb->root || qa->fault != PF_OK || qb->fault != PF_OK)
+            continue;
+        int k = st->nbank++;
+        st->bank_parts[k] = (int16_t)i;
+        st->bank_a[k] = (int16_t)qe->pin_a;
+        st->bank_b[k] = (int16_t)qe->pin_b;
+    }
+}
+
+static void series_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    if (__builtin_expect(st->epoch != s->epoch, 0)) series_bank_setup(s, p);
+    const element_t *e = &st->el[0];
+    if (__builtin_expect(st->off, 0)) {
+        sim_drive(s, e->pin_b, DRV_Z);
+        sim_drive(s, e->pin_a, DRV_Z);
+        return;
+    }
+    const pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    drive_t da = through_fast(&s->nets[a->root], a->eff);
+    drive_t db = through_fast(&s->nets[b->root], b->eff);
+    sim_drive(s, e->pin_b, da);
+    sim_drive(s, e->pin_a, db);
+    for (int k = 0; k < st->nbank; k++) {
+        int qpart = st->bank_parts[k];
+        if (!s->dirty[qpart]) continue;
+        s->dirty[qpart] = 0;
+        int pa = st->bank_a[k], pb = st->bank_b[k];
+        const pin_t *qa = &s->pins[pa], *qb = &s->pins[pb];
+        drive_t qda = through_fast(&s->nets[qa->root], qa->eff);
+        drive_t qdb = through_fast(&s->nets[qb->root], qb->eff);
+        sim_drive(s, pb, qda);
+        sim_drive(s, pa, qdb);
+    }
 }
 
 void resistor_eval(sim_t *s, part_t *p) {
@@ -616,9 +789,11 @@ void element_set_type(sim_t *s, part_t *p, int index, int type) {
     element_t *e = &st->el[index];
     e->type = type;
     pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    p->eval = resistor_eval;
     switch (type) {
     case EL_SERIES:     /* re-evaluated when anything on either side changes */
         a->flags = b->flags = PIN_SENSE | PIN_SWITCH | PIN_IN | PIN_OUT;
+        if (st->nel == 1 && index == 0) p->eval = series_eval;
         break;
     case EL_DIODE:
         a->flags = PIN_OUT;
@@ -635,7 +810,6 @@ void element_set_type(sim_t *s, part_t *p, int index, int type) {
         p->commit = resistor_commit;
         break;
     }
-    p->eval = resistor_eval;
 }
 
 /* ------------------------------------------------------------------------ */

@@ -573,6 +573,7 @@ void sim_settle(sim_t *s) {
     int budget = s->osc_after && s->oscillations >= s->osc_after ? 256 : 20000;
     while (s->qhead != s->qtail && budget--) {
         int part = s->queue[s->qhead++ & (SIM_QUEUE_SIZE - 1)];
+        if (!s->dirty[part]) continue;
         s->dirty[part] = 0;
         part_t *p = &s->parts[part];
         if (p->dead) continue;
