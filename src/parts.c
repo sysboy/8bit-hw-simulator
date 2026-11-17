@@ -424,10 +424,12 @@ const part_type_t PT_74LS257 = { "74LS257", MUX_PINS, ls257_eval, 0, 0, 0, TECH_
 const part_type_t PT_74LS258 = { "74LS258", MUX_PINS, ls258_eval, 0, 0, 0, TECH_TTL };
 
 /* 74LS373: octal transparent latch. While LE is high the outputs follow the
- * inputs; when LE goes low the last value is held. /OE high: outputs off. */
+ * inputs; when LE goes low the last value is held. /OE high: outputs off.
+ * Sections ordered as U26 sits on VA0-VA7, so part_read_bus() hits the bus
+ * bitmap. */
 typedef struct { uint8_t latch; int32_t out_cache; } ls373_state_t;
-static const int ls373_d[8] = { 3, 4, 7, 8, 13, 14, 17, 18 };
-static const int ls373_q[8] = { 2, 5, 6, 9, 12, 15, 16, 19 };
+static const int ls373_d[8] = { 7, 13, 8, 14, 17, 18, 4, 3 };
+static const int ls373_q[8] = { 6, 12, 9, 15, 16, 19, 5, 2 };
 
 static void ls373_eval(sim_t *s, part_t *p) {
     ls373_state_t *st = p->state;

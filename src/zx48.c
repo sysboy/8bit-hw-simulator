@@ -723,16 +723,22 @@ static void zx_create(board_t *b) {
         z->pin_kb_line[l] = pin_on_net(b, "KB1", net);
     }
     zx_init_keymap(z);
-    /* Buses, for the bus bitmap (speed only). */
+    /* Buses, for the bus bitmap (speed only). The 4116s receive LA0-LA6 on
+     * their A0-A6 pins in the order LA2, LA0, LA6, LA4, LA1, LA5, LA3. */
     char name[32];
     int bit = 0;
     static const struct { const char *fmt; int n; } buses[] = {
-        { "A%d", 16 }, { "D%d", 8 }, { "LA%d", 7 }, { "UA%d", 8 }, { "Net-(IC1-D%d)", 8 } };
+        { "A%d", 16 }, { "D%d", 8 }, { "UA%d", 8 }, { "Net-(IC1-D%d)", 8 } };
     for (size_t k = 0; k < sizeof(buses) / sizeof(buses[0]); k++)
         for (int i = 0; i < buses[k].n; i++) {
             snprintf(name, sizeof(name), buses[k].fmt, i);
             sim_set_bus_bit(s, sim_find_net(s, name), bit++);
         }
+    static const int la_order[7] = { 2, 0, 6, 4, 1, 5, 3 };
+    for (int i = 0; i < 7; i++) {
+        snprintf(name, sizeof(name), "LA%d", la_order[i]);
+        sim_set_bus_bit(s, sim_find_net(s, name), bit++);
+    }
     /* Power, reset, the RESET button (edge connector /RESET to GND). */
     z->pin_9v = pin_on_net(b, V(b)->power_in, "+9V");
     z->pin_12v = pin_on_net(b, "D15", "+12V");
