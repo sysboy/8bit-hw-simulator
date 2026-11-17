@@ -164,9 +164,30 @@ const pla_term_t pla_terms[] = {
 };
 const int pla_nterms = sizeof(pla_terms) / sizeof(pla_terms[0]);
 
+typedef struct {
+    uint32_t epoch;
+    uint16_t open_mask;
+    int16_t root[PLA_NIN];
+    int32_t out_cache;
+} pla_state_t;
+
 unsigned pla_read_inputs(sim_t *s, part_t *p) {
-    unsigned in = 0;
-    for (int k = 0; k < PLA_NIN; k++) in |= (unsigned)pin_in(s, p, pla_in_pin[k]) << k;
+    pla_state_t *st = p->state;
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        st->epoch = s->epoch;
+        st->open_mask = 0;
+        for (int k = 0; k < PLA_NIN; k++) {
+            int pi = p->pinmap[pla_in_pin[k]];
+            if (pi < 0 || s->pins[pi].fault == PF_OPEN || s->pins[pi].root < 0) {
+                st->open_mask |= (uint16_t)(1u << k);
+                st->root[k] = 0;
+            } else {
+                st->root[k] = s->pins[pi].root;
+            }
+        }
+    }
+    unsigned in = st->open_mask;
+    for (int k = 0; k < PLA_NIN; k++) in |= (unsigned)(s->nread[st->root[k]] != 0) << k;
     return in;
 }
 
@@ -194,16 +215,16 @@ unsigned pla_logic(unsigned in) {
 }
 
 static void pla_eval(sim_t *s, part_t *p) {
-    unsigned out = pla_logic(pla_read_inputs(s, p));
+    pla_state_t *st = p->state;
     bool en = !pin_in(s, p, 19);            /* /OE, tied to GND */
-    for (int k = 0; k < PLA_NOUT; k++)
-        pin_out(s, p, pla_out_pin[k], en ? DRV_BIT((out >> k) & 1) : DRV_Z);
+    unsigned out = en ? pla_logic(pla_read_inputs(s, p)) : 0;
+    part_drive_bus_cached(s, p, pla_out_pin, PLA_NOUT, out, en, &st->out_cache);
 }
 
 const part_type_t PT_82S100 = { "82S100 PLA",
     "FE:O A13:T A14:T A15:T /VA14:T /CHAREN:T /HIRAM:T /LORAM:T /CAS:T /ROMH:O /ROML:O "
     "/IO:O GR/W:O GND:P /CHAROM:O /KERNAL:O /BASIC:O /CASRAM:O /OE:T VA12:T VA13:T "
-    "/GAME:T /EXROM:T R/W:T /AEC:T BA:T A12:T VCC:P", pla_eval, 0, 0, 0, TECH_TTL };
+    "/GAME:T /EXROM:T R/W:T /AEC:T BA:T A12:T VCC:P", pla_eval, 0, 0, sizeof(pla_state_t), TECH_TTL };
 
 /* ------------------------------------------------------------------------ */
 /* Memory faults (part_t.mfault, see sim.h)                                  */
@@ -939,7 +960,7 @@ enum { SPLA_A13 = 1, SPLA_A14, SPLA_A15, SPLA_RW, SPLA_LORAM, SPLA_HIRAM, SPLA_C
        SPLA_SID, SPLA_ROML, SPLA_IO2, SPLA_EXROM, SPLA_GAME, SPLA_IO1 = 49, SPLA_ROMH };
 static const int spla_ma[8] = { 26, 29, 27, 25, 28, 30, 24, 31 };         /* MA0-MA7 */
 static const int spla_a[16] = { 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1, 2, 3 };    /* A0-A15 */
-typedef struct { uint8_t latch; int32_t ma_cache, a_cache; } superpla_state_t;
+typedef struct { uint8_t latch; int32_t ma_cache, a_cache, pla_cache, io_cache; } superpla_state_t;
 
 /* The PLA's inputs, in the 82S100's order (pla_in_pin): VA12/VA13 are
  * MA4/MA5, PI_AEC is AEC inverted. */
@@ -963,20 +984,28 @@ static void superpla_eval(sim_t *s, part_t *p) {
     bool cpu = pin_in(s, p, SPLA_AEC);
     unsigned a = part_read_bus(s, p, spla_a, 16);
     unsigned out = pla_logic(superpla_read_inputs(s, p));
-    static const int pla_outs[][2] = { { SPLA_ROMH, PO_ROMH }, { SPLA_ROML, PO_ROML }, { SPLA_CHARROM, PO_CHAROM },
-                                       { SPLA_KERNAL, PO_KERNAL }, { SPLA_BASIC, PO_BASIC }, { SPLA_CASRAM, PO_CASRAM } };
-    for (int i = 0; i < 6; i++) pin_out(s, p, pla_outs[i][0], DRV_BIT((out >> pla_outs[i][1]) & 1));
+    if (st->pla_cache != (int32_t)out + 1) {
+        st->pla_cache = (int32_t)out + 1;
+        static const int pla_outs[][2] = { { SPLA_ROMH, PO_ROMH }, { SPLA_ROML, PO_ROML }, { SPLA_CHARROM, PO_CHAROM },
+                                           { SPLA_KERNAL, PO_KERNAL }, { SPLA_BASIC, PO_BASIC }, { SPLA_CASRAM, PO_CASRAM } };
+        for (int i = 0; i < 6; i++) pin_out(s, p, pla_outs[i][0], DRV_BIT((out >> pla_outs[i][1]) & 1));
+    }
     /* The I/O decoder. */
-    bool y1[4] = { true, true, true, true }, y2[4] = { true, true, true, true };
-    if (!((out >> PO_IO) & 1)) y1[a >> 10 & 3] = false;
-    if (!y1[3]) y2[a >> 8 & 3] = false;
-    pin_out(s, p, SPLA_VIC, DRV_BIT(y1[0]));
-    pin_out(s, p, SPLA_SID, DRV_BIT(y1[1]));
-    pin_out(s, p, SPLA_COLRAM, DRV_BIT(y1[2] && cpu));
-    pin_out(s, p, SPLA_CIA1, DRV_BIT(y2[0]));
-    pin_out(s, p, SPLA_CIA2, DRV_BIT(y2[1]));
-    pin_out(s, p, SPLA_IO1, DRV_BIT(y2[2]));
-    pin_out(s, p, SPLA_IO2, DRV_BIT(y2[3]));
+    bool io_sel = !((out >> PO_IO) & 1);
+    int32_t io_key = (io_sel ? (int32_t)((a >> 8) & 15) + 2 : 1) | ((int32_t)cpu << 5);
+    if (st->io_cache != io_key) {
+        st->io_cache = io_key;
+        bool y1[4] = { true, true, true, true }, y2[4] = { true, true, true, true };
+        if (io_sel) y1[a >> 10 & 3] = false;
+        if (!y1[3]) y2[a >> 8 & 3] = false;
+        pin_out(s, p, SPLA_VIC, DRV_BIT(y1[0]));
+        pin_out(s, p, SPLA_SID, DRV_BIT(y1[1]));
+        pin_out(s, p, SPLA_COLRAM, DRV_BIT(y1[2] && cpu));
+        pin_out(s, p, SPLA_CIA1, DRV_BIT(y2[0]));
+        pin_out(s, p, SPLA_CIA2, DRV_BIT(y2[1]));
+        pin_out(s, p, SPLA_IO1, DRV_BIT(y2[2]));
+        pin_out(s, p, SPLA_IO2, DRV_BIT(y2[3]));
+    }
     pin_out(s, p, SPLA_RAMRW, DRV_BIT(!cpu || pin_in(s, p, SPLA_RW)));
     pin_out(s, p, SPLA_NMI, DRV_BIT(pin_in(s, p, SPLA_RESTORE)));
     /* The RAM address: the CPU's row or column, or in VIC cycles MA6/MA7

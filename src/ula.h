@@ -45,6 +45,7 @@ typedef struct {
     bool mic_reads_ear;
     uint32_t inputs;
     uint8_t pix;                    /* the colour of the last pixel (bit 3 bright) */
+    int32_t addr_cache, data_cache;
 } ula_state_t;
 
 extern const part_type_t PT_ULA;
