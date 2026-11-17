@@ -183,18 +183,20 @@ static void zx_step(board_t *b) {
     zx48_t *z = ZX(b);
     sim_t *s = &b->sim;
     ula_step(s, &s->parts[z->p_ula]);
-    if (contention_log) {
+    if (__builtin_expect(contention_log, 0)) {
         static bool irq_prev;
         bool irq = ((ula_state_t *)s->parts[z->p_ula].state)->irq;
         frame_step = irq && !irq_prev ? 0 : frame_step + 1;
         irq_prev = irq;
     }
-    sim_settle(s);
-    int clk = sim_read(s, z->pin_clk);
-    if (clk != z->clk) {
-        z->clk = clk;
-        cpu_edge(b, clk);
+    if (s->qhead != s->qtail || __builtin_expect(s->nnoisy != 0, 0)) {
         sim_settle(s);
+        int clk = sim_read(s, z->pin_clk);
+        if (clk != z->clk) {
+            z->clk = clk;
+            cpu_edge(b, clk);
+            sim_settle(s);
+        }
     }
     /* The memories and delays only act on edges: if no net changed since
      * the last commit there is nothing to see. */
@@ -204,7 +206,7 @@ static void zx_step(board_t *b) {
         z->changes_seen = s->changes;
     }
     board_sample(b);
-    if (ula_log_file && s->cycle >= ula_log_from) {
+    if (__builtin_expect(ula_log_file != NULL, 0) && s->cycle >= ula_log_from) {
         char line[160];
         ula_log(s->parts[z->p_ula].state, ula_log_step++, line, sizeof(line));
         fprintf(ula_log_file, "%s\n", line);

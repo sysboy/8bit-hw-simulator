@@ -103,6 +103,7 @@ static void ula_eval(sim_t *s, part_t *p) {
     ula_state_t *u = p->state;
     bool mreq = !pin_in(s, p, P_MREQ), a14 = pin_in(s, p, P_A14), a15 = pin_in(s, p, P_A15);
     bool rd = !pin_in(s, p, P_RD), wr = !pin_in(s, p, P_WR), iorq = !pin_in(s, p, P_IOREQ);
+    u->in_mreq = mreq; u->in_iorq = iorq; u->in_rd = rd; u->in_wr = wr; u->in_a14 = a14; u->in_a15 = a15;
     bool ram16 = a14 && !a15 && mreq;                      /* the CPU wants 0x4000-0x7FFF */
     bool ras = u->ras || ram16;
     /* /RAS is let go when the CPU accesses the ROM in the border: then the
@@ -137,10 +138,15 @@ static void ula_eval(sim_t *s, part_t *p) {
     u->dlow = low;      /* only for ula_log() */
 }
 
+static const uint32_t ula_palette[16] = {
+    0xFF000000u, 0xFFD70000u, 0xFF0000D7u, 0xFFD700D7u,
+    0xFF00D700u, 0xFFD7D700u, 0xFF00D7D7u, 0xFFD7D7D7u,
+    0xFF000000u, 0xFFFF0000u, 0xFF0000FFu, 0xFFFF00FFu,
+    0xFF00FF00u, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFFFFFFu
+};
+
 uint32_t ula_color(int index, bool bright) {
-    uint32_t lvl = bright ? 0xFF : 0xD7;
-    uint32_t r = (index & 2) ? lvl : 0, g = (index & 4) ? lvl : 0, b = (index & 1) ? lvl : 0;
-    return 0xFF000000u | (b << 16) | (g << 8) | r;
+    return ula_palette[(index & 7) | (bright ? 8 : 0)];
 }
 
 /* The pixel of the current tick, into the picture. Cell k of a line is
@@ -160,30 +166,52 @@ static void put_pixel(ula_state_t *u) {
     } else {
         u->pix = u->border_shown;
     }
-    int x = ((int)u->c - 16 + 48 + ULA_TICKS_PER_LINE) % ULA_TICKS_PER_LINE;
+    if (!u->fb) return;
     int y = u->v < 248 ? (int)u->v + 48 : (int)u->v - 264;
-    if (!u->fb || x >= ULA_SCREEN_W || y < 0 || y >= ULA_SCREEN_H) return;
-    u->fb[y * ULA_SCREEN_W + x] = ula_color(u->pix & 7, u->pix & 8);
+    if (y < 0 || y >= ULA_SCREEN_H) return;
+    int x = (int)u->c + 32;
+    if (x >= ULA_TICKS_PER_LINE) x -= ULA_TICKS_PER_LINE;
+    if (x >= ULA_SCREEN_W) return;
+    u->fb[y * ULA_SCREEN_W + x] = ula_palette[u->pix & 15];
 }
 
 void ula_step(sim_t *s, part_t *p) {
     ula_state_t *u = p->state;
     if (p->dead || !u->running) return;
     /* Time. */
-    u->half = (u->half + 1) & 3;
-    if (u->half == 0) {
+    unsigned h = (u->half + 1) & 3;
+    u->half = (uint8_t)h;
+    if (h == 0) {
         if (++u->c == ULA_TICKS_PER_LINE) {
             u->c = 0;
             if (++u->v == ULA_LINES) { u->v = 0; u->frames++; }
         }
         put_pixel(u);
     }
-    unsigned c = u->c, h = u->half, blk = c & 15;
+    unsigned c = u->c, blk = c & 15;
     bool screen = on_screen(u);
-    /* Inputs, as the board settled them. */
-    bool mreq = !pin_in(s, p, P_MREQ), iorq = !pin_in(s, p, P_IOREQ);
-    bool rd = !pin_in(s, p, P_RD), wr = !pin_in(s, p, P_WR);
-    bool a14 = pin_in(s, p, P_A14), a15 = pin_in(s, p, P_A15);
+    /* Inputs, as the board settled them in ula_eval(). */
+    bool mreq = u->in_mreq, iorq = u->in_iorq;
+    bool rd = u->in_rd, wr = u->in_wr;
+    bool a14 = u->in_a14, a15 = u->in_a15;
+    if (__builtin_expect(h != 0 && (!screen || blk < 7) && u->v != 248 && !u->logging && !iorq, 1)) {
+        if ((c & 7) == 5) u->border_ao = u->border;
+        bool border = !screen, c23 = (c & 12) != 0;
+        bool base = (c & 1) != 0;
+        bool w362 = !u->ioreqt2 && !border && u->cpuclk && !u->mreqt2;
+        bool held = p->cfault != CF_NOCONTENTION;
+        bool mem = held && a14 && !a15 && c23 && w362;
+        bool cpuclk = base || mem;
+        if (!cpuclk) { u->mreqt2 = mreq; u->ioreqt2 = false; }
+        bool cpu_cas = u->cpu_cas_req;
+        u->cpu_cas_req = (rd || wr) && a14 && !a15 && mreq;
+        if (cpuclk != u->cpuclk || u->ras || u->cas || u->ae || u->irq || cpu_cas != u->cpu_cas) {
+            u->cpuclk = cpuclk; u->ras = false; u->cas = false; u->ae = false;
+            u->irq = false; u->cpu_cas = cpu_cas;
+            sim_mark_dirty(s, (int)(p - s->parts));
+        }
+        return;
+    }
     if (u->logging)
         u->inputs = (uint32_t)(!mreq) | (uint32_t)(!iorq) << 1 | (uint32_t)(!rd) << 2 | (uint32_t)(!wr) << 3 |
                     (uint32_t)a14 << 4 | (uint32_t)a15 << 5 | (uint32_t)peek(s, p, P_A0) << 6 |
