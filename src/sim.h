@@ -328,8 +328,9 @@ static inline drive_t sim_drive_others(const sim_t *s, int pin) {
     const net_t *n = &s->nets[p->root];
     unsigned kinds = n->kinds;
     if ((p->eff >> 1) && n->count[p->eff] == 1) kinds &= ~(1u << p->eff);
-    int contention;
-    return sim_combine(kinds, &contention);
+    if (!kinds) return DRV_Z;
+    int st = (31 - __builtin_clz(kinds)) >> 1;
+    return DRIVE(st, !(kinds & (1u << DRIVE(st, 0))));
 }
 
 /* Change a pin fault (the caller must sim_rebuild() afterwards). An opened

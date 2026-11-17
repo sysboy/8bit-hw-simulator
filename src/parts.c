@@ -446,17 +446,35 @@ const part_type_t PT_74LS373 = { "74LS373",
 /* 4066: four bidirectional analog switches. When a switch is on, each side
  * gets whatever drives the other side (excluding the switch itself), so a
  * signal passes through in either direction. */
+typedef struct {
+    uint32_t epoch;
+    int16_t pin_a[4], pin_b[4], pin_c[4];
+    uint8_t was_on[4];
+} cd4066_state_t;
+
 static void cd4066_eval(sim_t *s, part_t *p) {
-    static const int sw[4][3] = { {1, 2, 13}, {4, 3, 5}, {8, 9, 6}, {11, 10, 12} };
+    cd4066_state_t *st = p->state;
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        static const int sw[4][3] = { {1, 2, 13}, {4, 3, 5}, {8, 9, 6}, {11, 10, 12} };
+        st->epoch = s->epoch;
+        for (int i = 0; i < 4; i++) {
+            st->pin_a[i] = (int16_t)part_pin(p, sw[i][0]);
+            st->pin_b[i] = (int16_t)part_pin(p, sw[i][1]);
+            st->pin_c[i] = (int16_t)part_pin(p, sw[i][2]);
+            st->was_on[i] = 1;
+        }
+    }
     for (int i = 0; i < 4; i++) {
-        int a = part_pin(p, sw[i][0]), b = part_pin(p, sw[i][1]);
+        int a = st->pin_a[i], b = st->pin_b[i];
         if (a < 0 || b < 0) continue;
-        if (pin_in(s, p, sw[i][2])) {
+        if (sim_read(s, st->pin_c[i])) {
+            st->was_on[i] = 1;
             drive_t from_a = sim_drive_others(s, a);
             drive_t from_b = sim_drive_others(s, b);
             sim_drive(s, a, from_b);
             sim_drive(s, b, from_a);
-        } else {
+        } else if (st->was_on[i]) {
+            st->was_on[i] = 0;
             sim_drive(s, a, DRV_Z);
             sim_drive(s, b, DRV_Z);
         }
@@ -464,7 +482,7 @@ static void cd4066_eval(sim_t *s, part_t *p) {
 }
 const part_type_t PT_4066 = { "4066",
     "1A:S 1B:S 2B:S 2A:S C2:M C3:M VSS:P 3A:S 3B:S 4B:S 4A:S C4:M C1:M VDD:P",
-    cd4066_eval, 0, 0, 0, TECH_CMOS };
+    cd4066_eval, 0, 0, sizeof(cd4066_state_t), TECH_CMOS };
 
 /* 556 dual timer (U20), modeled by what it does on the C64:
  *  - timer 2: holds the system in reset for a while after power-on (OUT2
