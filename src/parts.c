@@ -945,7 +945,7 @@ const part_type_t PT_27128 = { "27128 EPROM",
 /* 74LS14: hex Schmitt trigger inverter (the analog side of its inputs,
  * the reset RC and the mains, is not simulated: see c64.c). */
 const part_type_t PT_74LS14 = { "74LS14",
-    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL };
 
 /* MOS 8701 clock generator (U20): with the crystal Y1 it makes the color
  * clock (pin 8) and, divided down, the dot clock (pin 6) for the VIC.
