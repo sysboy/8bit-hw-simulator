@@ -1,5 +1,6 @@
 /* sim.c - the electrical net engine. See sim.h for the concepts. */
 #include "sim.h"
+#include "sim_combine_table.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
