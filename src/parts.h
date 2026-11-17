@@ -133,7 +133,13 @@ typedef struct { bool crystal_ok; } vco_state_t;
  *   ANALOG           not simulated */
 enum { EL_PULLUP, EL_PULLDOWN, EL_LINK, EL_ANALOG, EL_SERIES, EL_DIODE, EL_DELAY, EL_NPN, EL_FOLLOWER };
 typedef struct { int pin_a, pin_b, type; } element_t;
-typedef struct { element_t el[16]; int nel; uint8_t delayed[16]; } resistor_state_t;
+typedef struct {
+    element_t el[16];
+    int nel;
+    uint8_t delayed[16];
+    uint32_t epoch;
+    uint8_t off;
+} resistor_state_t;
 void resistor_eval(sim_t *s, part_t *p);
 void resistor_commit(sim_t *s, part_t *p);
 /* Make an element one of the active kinds above (sets pin flags, eval and
