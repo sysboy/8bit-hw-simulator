@@ -321,6 +321,7 @@ enum {
 static void dram_cycle(sim_t *s, part_t *p, int bits, int half) {
     dram_state_t *st = p->state;
     int ras = pin_in(s, p, 4), cas = pin_in(s, p, 15);
+    if (ras == st->ras_prev && cas == st->cas_prev) return;
     uint8_t out_en = st->out_en, out_bit = st->out_bit;
     /* A dead address line inside the chip is dead for the row and the
      * column alike: they come in through the same buffer. */
@@ -831,6 +832,7 @@ static void d41464_eval(sim_t *s, part_t *p) {
 static void d41464_commit(sim_t *s, part_t *p) {
     dram4_state_t *st = p->state;
     int ras = pin_in(s, p, 5), cas = pin_in(s, p, 16);
+    if (ras == st->ras_prev && cas == st->cas_prev) return;
     uint8_t out_en = st->out_en, out_val = st->out_val;
     if (st->ras_prev && !ras) st->row = (uint8_t)mem_addr(p, part_read_bus(s, p, d41464_addr_pins, 8));
     if (st->cas_prev && !cas && !ras) {
