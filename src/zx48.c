@@ -74,6 +74,17 @@ static const int z80_data_pins[8] = { 14, 15, 12, 8, 7, 9, 10, 13 };
 enum { Z_CLK = 6, Z_INT = 16, Z_NMI = 17, Z_HALT = 18, Z_MREQ = 19, Z_IORQ = 20, Z_RD = 21, Z_WR = 22,
        Z_BUSAK = 23, Z_WAIT = 24, Z_BUSRQ = 25, Z_RESET = 26, Z_M1 = 27, Z_RFSH = 28 };
 
+#define ZX_MAX_BANKS 16
+typedef struct {
+    char name[64];
+    uint8_t rom[16384];         /* the selected bank */
+    int pin_romcs, pin_mreq, pin_rd, pin_a[16], pin_d[8];
+    int pin_iorq, pin_wr, pin_reset;
+    bool out;                   /* paged out (port 1F, bit 5) */
+    int nbanks, bank;
+    uint8_t image[];            /* nbanks * 16K */
+} zxcart_t;
+
 /* ------------------------------------------------------------------------ */
 /* Z80 (IC2)                                                                 */
 /* ------------------------------------------------------------------------ */
@@ -132,6 +143,11 @@ static void cpu_edge(board_t *b, int clk) {
     z->in_reset = (pins & Z80_RES) != 0;
     uint64_t out = z80_tick(&z->cpu, pins);
     if (out != z->cpu_pins) { z->cpu_pins = out; sim_mark_dirty(s, z->p_cpu); }
+    if (z->fast_ok && (out & (Z80_AOE | Z80_MREQ | Z80_WR)) == (Z80_AOE | Z80_MREQ | Z80_WR)) {
+        uint16_t a = Z80_GET_ADDR(out);
+        if (a >= 0x4000 && (a < 0x8000 || (!z->ram16k && z->uram_part[0] >= 0)))
+            z->fast_ram[a] = (uint8_t)Z80_GET_DATA(out);
+    }
     if (contention_log && clk) {
         uint16_t a = Z80_GET_ADDR(out);
         rise_contended = (out & Z80_AOE) && (a & 0xC000) == 0x4000 && !(out & (Z80_MREQ | Z80_IORQ));
@@ -189,19 +205,21 @@ static void zx_step(board_t *b) {
         frame_step = irq && !irq_prev ? 0 : frame_step + 1;
         irq_prev = irq;
     }
-    sim_settle(s);
-    int clk = sim_read(s, z->pin_clk);
-    if (clk != z->clk) {
-        z->clk = clk;
-        cpu_edge(b, clk);
+    if (s->qhead != s->qtail || s->nnoisy) {
         sim_settle(s);
-    }
-    /* The memories and delays only act on edges: if no net changed since
-     * the last commit there is nothing to see. */
-    if (s->changes != z->changes_seen) {
-        sim_commit(s);
-        sim_settle(s);
-        z->changes_seen = s->changes;
+        int clk = sim_read(s, z->pin_clk);
+        if (clk != z->clk) {
+            z->clk = clk;
+            cpu_edge(b, clk);
+            sim_settle(s);
+        }
+        /* The memories and delays only act on edges: if no net changed since
+         * the last commit there is nothing to see. */
+        if (s->changes != z->changes_seen) {
+            sim_commit(s);
+            sim_settle(s);
+            z->changes_seen = s->changes;
+        }
     }
     board_sample(b);
     if (ula_log_file && s->cycle >= ula_log_from) {
@@ -219,18 +237,249 @@ static void reset_tick(board_t *b) {
     sim_drive(&b->sim, z->pin_reset_cap, b->sim.cycle < z->reset_until ? DRV_LO : DRV_Z);
 }
 
+static void zx_sync_epoch(board_t *b);
+static void zx_sync_to_dram(board_t *b);
+static void zx_sync_to_netlist(board_t *b);
+
+static inline unsigned zx_bitmap_addr(unsigned v, unsigned k) {
+    return ((v & 0xC0) << 5) | ((v & 7) << 8) | ((v & 0x38) << 2) | k;
+}
+static inline unsigned zx_attr_addr(unsigned v, unsigned k) {
+    return 0x1800 | ((v & 0xF8) << 2) | k;
+}
+
+static inline void zx_put_pixel_fast(ula_state_t *u) {
+    unsigned c = u->c, v = u->v;
+    if ((c & 7) == 0) u->border_shown = u->border_ao;
+    if (v < 192 && c >= 16 && c < 272) {
+        unsigned px = c - 16, k = px >> 3;
+        uint8_t a = u->line_attr[k], b = u->line_bitmap[k];
+        bool ink = (b >> (7 - (px & 7))) & 1;
+        if ((a & 0x80) && ((u->frames >> 4) & 1)) ink = !ink;
+        u->pix = (uint8_t)((ink ? (a & 7) : ((a >> 3) & 7)) | ((a & 0x40) >> 3));
+    } else {
+        u->pix = u->border_shown;
+    }
+    if (!u->fb) return;
+    int y = v < 248 ? (int)v + 48 : (int)v - 264;
+    if ((unsigned)y >= ULA_SCREEN_H) return;
+    unsigned x = c + 32;
+    if (x >= ULA_TICKS_PER_LINE) x -= ULA_TICKS_PER_LINE;
+    if (x >= ULA_SCREEN_W) return;
+    u->fb[y * ULA_SCREEN_W + x] = ula_palette[u->pix & 15];
+}
+
+static inline uint8_t zx_cpu_bus_read_fast(const zx48_t *z, const ula_state_t *u, uint8_t fbus) {
+    uint64_t pins = z->cpu_pins;
+    if (pins & Z80_DOE) return (uint8_t)Z80_GET_DATA(pins);
+    if (!(pins & Z80_AOE)) return 0xFF;
+    uint16_t addr = Z80_GET_ADDR(pins);
+    if ((pins & (Z80_MREQ | Z80_RD)) == (Z80_MREQ | Z80_RD)) {
+        if (addr < 0x4000) {
+            const zxcart_t *c = z->cart;
+            if (c && !c->out) return c->rom[addr];
+            return zx48_rom[addr];
+        }
+        if (addr < 0x8000) return z->fast_ram[addr];
+        return (!z->ram16k && z->uram_part[0] >= 0) ? z->fast_ram[addr] : 0xFF;
+    }
+    if ((pins & (Z80_IORQ | Z80_RD)) == (Z80_IORQ | Z80_RD) && !(addr & 1) && u->ioreqt2) {
+        uint8_t low = 0;
+        uint8_t row_mask = (uint8_t)~(addr >> 8);
+        for (int i = 0; i < 5; i++)
+            if (z->key_matrix[i] & row_mask) low |= (uint8_t)(1u << i);
+        if (!u->ear_in && !(u->speaker || (u->mic_reads_ear && u->mic))) low |= 0x40;
+        return (uint8_t)(0xFF ^ low);
+    }
+    return fbus;
+}
+
+static inline void zx_cpu_bus_write_fast(zx48_t *z, ula_state_t *u, uint16_t addr, uint8_t d,
+                                         bool mreq, bool iorq_cpu, bool iorq) {
+    if (mreq) {
+        if (addr >= 0x4000 && (addr < 0x8000 || (!z->ram16k && z->uram_part[0] >= 0))) {
+            if (z->fast_ram[addr] != d) {
+                z->fast_ram[addr] = d;
+                z->fast_dirty_pages |= 1ULL << (addr >> 10);
+            }
+        }
+    }
+    if (iorq && !(addr & 1) && u->ioreqt2) {
+        u->border = d & 7;
+        u->mic = (d >> 3) & 1;
+        u->speaker = (d >> 4) & 1;
+    }
+    if (__builtin_expect(z->cart != NULL && iorq_cpu && !(addr & 0x00E0), 0))
+        ((zxcart_t *)z->cart)->out = ((d >> 5) & 1) != 0;
+}
+
+/* One full Z80 T-state (8 half-periods of 14 MHz) on a healthy board.
+ * Enters and exits at u->half == 0, u->c even, u->cpuclk == true, z->clk == 1. */
+static void zx_cycle_fast(board_t *b) {
+    zx48_t *z = ZX(b);
+    sim_t *s = &b->sim;
+    ula_state_t *u = s->parts[z->p_ula].state;
+    unsigned c0 = u->c, v = u->v, blk0 = c0 & 15;
+    bool screen = (c0 < 256 && v < 192);
+    if (__builtin_expect(z->cart != NULL && s->cycle < z->reset_until, 0))
+        ((zxcart_t *)z->cart)->out = false;
+
+    uint64_t pins = z->cpu_pins;
+    bool aoe = (pins & Z80_AOE) != 0;
+    uint16_t addr = aoe ? Z80_GET_ADDR(pins) : 0xFFFF;
+    bool mreq = aoe && (pins & Z80_MREQ) != 0;
+    bool rd = aoe && (pins & Z80_RD) != 0;
+    bool wr = aoe && (pins & Z80_WR) != 0;
+    bool iorq_cpu = aoe && (pins & Z80_IORQ) != 0;
+    bool a0 = (addr & 1) != 0, a14 = (addr >> 14) & 1, a15 = (addr >> 15) & 1;
+    bool iorq = iorq_cpu && (!z->has_tr6 || !a0);
+
+    /* ---- Half-periods k = 0, 1, 2 (c = c0 even, h = 1, 2, 3) ---- */
+    if (__builtin_expect(v == 248, 0)) u->irq = (c0 < 64);
+
+    bool contended = false;
+    if (screen && (c0 & 12) != 0) {
+        bool w362 = !u->ioreqt2 && !u->mreqt2;
+        bool mem = (a14 || iorq) && (iorq || !a15) && w362;
+        bool io = iorq && !u->ioreqt2;
+        contended = mem || io;
+    }
+
+    if (!contended) {
+        u->cpuclk = false;
+        u->mreqt2 = mreq;
+        u->ioreqt2 = iorq;
+
+        z->clk = 0;
+        z->last_edge = s->cycle;
+        uint64_t in_pins = (uint64_t)zx_cpu_bus_read_fast(z, u, 0xFF) << 16;
+        if (u->irq) in_pins |= Z80_INT;
+        if (s->cycle < z->reset_until) in_pins |= Z80_RES;
+        z->in_reset = (in_pins & Z80_RES) != 0;
+        pins = z80_tick(&z->cpu, in_pins);
+        z->cpu_pins = pins;
+
+        aoe = (pins & Z80_AOE) != 0;
+        addr = aoe ? Z80_GET_ADDR(pins) : 0xFFFF;
+        mreq = aoe && (pins & Z80_MREQ) != 0;
+        rd = aoe && (pins & Z80_RD) != 0;
+        wr = aoe && (pins & Z80_WR) != 0;
+        iorq_cpu = aoe && (pins & Z80_IORQ) != 0;
+        a0 = (addr & 1) != 0; a14 = (addr >> 14) & 1; a15 = (addr >> 15) & 1;
+        iorq = iorq_cpu && (!z->has_tr6 || !a0);
+
+        u->mreqt2 = mreq;
+        u->ioreqt2 = iorq;
+    }
+    if (wr) zx_cpu_bus_write_fast(z, u, addr, (uint8_t)Z80_GET_DATA(pins), mreq, iorq_cpu, iorq);
+
+    /* ---- Half-period k = 3 (c = c1 = c0 + 1 odd, h = 0) ---- */
+    unsigned c1 = c0 + 1, blk1 = blk0 + 1;
+    u->c = (uint16_t)c1;
+    zx_put_pixel_fast(u);
+
+    uint8_t fbus = 0xFF;
+    if (screen && blk1 >= 8) {
+        unsigned cell_k = ((c1 >> 4) << 1) | (blk1 >= 12);
+        uint16_t saddr = (uint16_t)(0x4000 | (((blk1 & 3) == 1) ? zx_bitmap_addr(v, cell_k) : zx_attr_addr(v, cell_k)));
+        fbus = z->fast_ram[saddr];
+        if ((blk1 & 3) == 1) {
+            u->data = fbus;
+        } else {
+            u->attr = fbus;
+            u->line_bitmap[cell_k] = u->data;
+            u->line_attr[cell_k] = fbus;
+        }
+    }
+
+    if (!contended) {
+        u->cpuclk = true;
+        z->clk = 1;
+        z->last_edge = s->cycle;
+        uint64_t in_pins = Z80_CLK | ((uint64_t)zx_cpu_bus_read_fast(z, u, fbus) << 16);
+        if (u->irq) in_pins |= Z80_INT;
+        if (s->cycle < z->reset_until) in_pins |= Z80_RES;
+        z->in_reset = (in_pins & Z80_RES) != 0;
+        pins = z80_tick(&z->cpu, in_pins);
+        z->cpu_pins = pins;
+
+        aoe = (pins & Z80_AOE) != 0;
+        addr = aoe ? Z80_GET_ADDR(pins) : 0xFFFF;
+        mreq = aoe && (pins & Z80_MREQ) != 0;
+        rd = aoe && (pins & Z80_RD) != 0;
+        wr = aoe && (pins & Z80_WR) != 0;
+        iorq_cpu = aoe && (pins & Z80_IORQ) != 0;
+        a0 = (addr & 1) != 0; a14 = (addr >> 14) & 1; a15 = (addr >> 15) & 1;
+        iorq = iorq_cpu && (!z->has_tr6 || !a0);
+        if (wr) zx_cpu_bus_write_fast(z, u, addr, (uint8_t)Z80_GET_DATA(pins), mreq, iorq_cpu, iorq);
+    }
+
+    /* ---- Half-periods k = 4, 5, 6 (c = c1 odd, h = 1, 2, 3) ---- */
+    if ((c1 & 7) == 5) u->border_ao = u->border;
+    bool ram16_req = (rd || wr) && a14 && !a15 && mreq;
+    u->cpu_cas = ram16_req;
+    u->cpu_cas_req = ram16_req;
+
+    /* ---- Half-period k = 7 (c = c2 even, h = 0) ---- */
+    unsigned c2 = c0 + 2;
+    if (__builtin_expect(c2 == ULA_TICKS_PER_LINE, 0)) {
+        c2 = 0;
+        if (++v == ULA_LINES) { v = 0; u->frames++; }
+        u->v = (uint16_t)v;
+    }
+    u->c = (uint16_t)c2;
+    u->half = 0;
+    zx_put_pixel_fast(u);
+    if (__builtin_expect(v == 248, 0)) u->irq = (c2 >= 2 && c2 <= 64);
+}
+
 static void zx_run(board_t *b, int cycles) {
     zx48_t *z = ZX(b);
     sim_t *s = &b->sim;
+    if (__builtin_expect(z->fast_epoch != s->epoch, 0)) zx_sync_epoch(b);
+    ula_state_t *u = s->parts[z->p_ula].state;
+    bool hooks = b->scope_pin >= 0 || b->hook_fn != NULL || board_edges_active(b) ||
+                 ula_log_file != NULL || contention_log;
     for (int i = 0; i < cycles; i++) {
         s->cycle++;
-        reset_tick(b);
-        for (int k = 0; k < ZX_STEPS_PER_CYCLE; k++) {
-            zx_step(b);
-            if (s->cycle >= trace_from && s->cycle < trace_to) trace_step(b, k);
+        if (__builtin_expect(s->cycle <= z->reset_until + 1, 0)) reset_tick(b);
+        if (__builtin_expect(z->fast_ok && !hooks && s->cycle > 2 &&
+                             z->clk == 1 && u->half == 0 && (u->c & 1) == 0 &&
+                             !(s->cycle >= trace_from && s->cycle < trace_to), 1)) {
+            z->fast_active = true;
+            zx_cycle_fast(b);
+            if (__builtin_expect((s->cycle % 2053) == 0, 0)) {
+                ula_state_t saved_u = *u;
+                int pk = (int)((s->cycle / 2053) & 7);
+                if (pk < 3) u->cpuclk = false;
+                if (u->c < 256 && u->v < 192 && (u->c & 15) >= 8) {
+                    u->ras = true;
+                    u->cas = (pk >= 1 && pk <= 2) || (pk >= 4 && pk <= 6);
+                }
+                zx_sync_to_netlist(b);
+                b->st_countdown = 1;
+                board_sample(b);
+                *u = saved_u;
+            }
+            if (__builtin_expect(i == cycles - 1, 0)) {
+                z->fast_active = false;
+                zx_sync_to_netlist(b);
+                b->st_countdown = 1;
+                board_sample(b);
+            }
+        } else {
+            if (z->fast_active) {
+                z->fast_active = false;
+                zx_sync_to_netlist(b);
+            }
+            for (int k = 0; k < ZX_STEPS_PER_CYCLE; k++) {
+                zx_step(b);
+                if (s->cycle >= trace_from && s->cycle < trace_to) trace_step(b, k);
+            }
         }
         z->cpu_running = s->cycle - z->last_edge < 1000;
     }
+    if (z->fast_dirty_pages) zx_sync_to_dram(b);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -687,6 +936,7 @@ static void zx_create(board_t *b) {
     }
     make_element(b, "TR3", 2, 1, EL_NPN);
     make_element(b, "TR6", 2, 3, EL_FOLLOWER);
+    z->has_tr6 = find(b, "TR6") != NULL;
     /* Which DRAM holds which bit: the one whose D pin is on Dn (upper) or
      * on the ULA's Dn (lower). */
     for (int i = 0; i < 8; i++) z->lram_part[i] = z->uram_part[i] = -1;
@@ -755,6 +1005,9 @@ static void zx_power_on(board_t *b) {
     z->in_reset = true;
     z->clk = 0;
     z->last_edge = 0;
+    z->fast_epoch = 0;
+    z->fast_dirty_pages = 0;
+    z->fast_active = false;
     z->reset_until = ZX_FREQ * 7 / 100;     /* 70 ms: R31 (220K) charging C27 (1 uF) */
     memset(b->screen, 0, ULA_SCREEN_W * ULA_SCREEN_H * sizeof(uint32_t));
     sim_drive(s, z->pin_9v, DRIVE(S_SUPPLY, 1));     /* the 9 V input (see zx_power) */
@@ -1014,6 +1267,7 @@ static void zx_ram_poke(board_t *b, uint16_t addr, uint8_t v) {
         dram_state_t *st = b->sim.parts[upper ? z->uram_part[bit] : z->lram_part[bit]].state;
         st->cells[cell] = (v >> bit) & 1;
     }
+    z->fast_ram[addr] = v;
 }
 
 static uint8_t ram_peek(board_t *b, uint16_t addr) {
@@ -1021,11 +1275,193 @@ static uint8_t ram_peek(board_t *b, uint16_t addr) {
     if (addr < 0x4000) return zx48_rom[addr];
     int upper = addr >= 0x8000;
     if (upper && z->uram_part[0] < 0) return 0xFF;  /* no upper RAM: the bus floats high */
+    if (z->fast_dirty_pages) zx_sync_to_dram(b);
     int cell = dram_cell(b, upper ? z->uram_part[0] : z->lram_part[0], addr);
     uint8_t v = 0;
     for (int bit = 0; bit < 8; bit++)
         v |= (uint8_t)(((dram_state_t *)b->sim.parts[upper ? z->uram_part[bit] : z->lram_part[bit]].state)->cells[cell] << bit);
     return v;
+}
+
+static bool zx_check_fast_ok(board_t *b) {
+    zx48_t *z = ZX(b);
+    const sim_t *s = &b->sim;
+    if (b->nbridges != 0 || s->nnoisy != 0 || b->reset_button) return false;
+    if (!z->rom_chip && z->rom_link != 0) return false;
+    if (!z->ram16k && z->uram_part[0] >= 0) {
+        if (V(b)->uram_links == ULINKS_TI_OKI) {
+            if (z->uram_chips < 4 && z->uram_links != z->uram_chips) return false;
+        } else if (V(b)->uram_links == ULINKS_LNK1) {
+            if (z->uram_chips < 2 && z->uram_links != z->uram_chips) return false;
+            if (z->uram_chips == 2 || z->uram_chips == 3) return false;
+        }
+    }
+    for (int i = 0; i < s->nparts; i++) {
+        const part_t *p = &s->parts[i];
+        if (p->removed != p->unfitted) return false;
+        if (!p->unfitted && p->kind == PART_IC && (p->dead || p->no_supply || p->supply_weak)) return false;
+        if (p->mfault != MF_OK || p->cfault != CF_OK || p->rfault != RF_OK) return false;
+    }
+    for (int i = 0; i < s->npins; i++)
+        if (s->pins[i].fault != PF_OK) return false;
+    return true;
+}
+
+static void zx_sync_to_dram(board_t *b) {
+    zx48_t *z = ZX(b);
+    sim_t *s = &b->sim;
+    while (z->fast_dirty_pages) {
+        int page = __builtin_ctzll(z->fast_dirty_pages);
+        z->fast_dirty_pages &= z->fast_dirty_pages - 1;
+        if (page < 16) continue;
+        int u = page >= 32;
+        if (u && (z->ram16k || z->uram_part[0] < 0)) continue;
+        uint8_t *cells[8];
+        for (int bit = 0; bit < 8; bit++)
+            cells[bit] = ((dram_state_t *)s->parts[u ? z->uram_part[bit] : z->lram_part[bit]].state)->cells;
+        for (int hi_a = page << 2; hi_a < (page + 1) << 2; hi_a++) {
+            uint16_t hi_c = z->ram_hi_lut[u][hi_a];
+            const uint8_t *src = &z->fast_ram[hi_a << 8];
+            for (int lo_a = 0; lo_a < 256; lo_a++) {
+                uint16_t cell = hi_c | z->ram_lo_lut[u][lo_a];
+                uint8_t v = src[lo_a];
+                cells[0][cell] = v & 1;
+                cells[1][cell] = (v >> 1) & 1;
+                cells[2][cell] = (v >> 2) & 1;
+                cells[3][cell] = (v >> 3) & 1;
+                cells[4][cell] = (v >> 4) & 1;
+                cells[5][cell] = (v >> 5) & 1;
+                cells[6][cell] = (v >> 6) & 1;
+                cells[7][cell] = (v >> 7) & 1;
+            }
+        }
+    }
+}
+
+static void zx_sync_epoch(board_t *b) {
+    zx48_t *z = ZX(b);
+    sim_t *s = &b->sim;
+    if (z->fast_dirty_pages) zx_sync_to_dram(b);
+    for (int u = 0; u < 2; u++) {
+        int p0 = u ? z->uram_part[0] : z->lram_part[0];
+        if (p0 < 0) continue;
+        int rb[8], cb[8], bits = dram_wiring(b, p0, rb, cb);
+        uint16_t c_const = 0;
+        for (int i = 0; i < bits; i++) {
+            if (rb[i] == -3) c_const |= (uint16_t)(1u << (i + 8));
+            if (cb[i] == -3) c_const |= (uint16_t)(1u << i);
+        }
+        for (int byte = 0; byte < 256; byte++) {
+            uint16_t lo = c_const, hi = 0;
+            for (int i = 0; i < bits; i++) {
+                if (rb[i] >= 0 && rb[i] < 8 && ((byte >> rb[i]) & 1)) lo |= (uint16_t)(1u << (i + 8));
+                if (cb[i] >= 0 && cb[i] < 8 && ((byte >> cb[i]) & 1)) lo |= (uint16_t)(1u << i);
+                if (rb[i] >= 8 && ((byte >> (rb[i] - 8)) & 1)) hi |= (uint16_t)(1u << (i + 8));
+                if (cb[i] >= 8 && ((byte >> (cb[i] - 8)) & 1)) hi |= (uint16_t)(1u << i);
+            }
+            z->ram_lo_lut[u][byte] = lo;
+            z->ram_hi_lut[u][byte] = hi;
+        }
+    }
+    z->fast_ok = zx_check_fast_ok(b);
+    z->fast_epoch = s->epoch;
+    if (!z->fast_ok) return;
+    for (int u = 0; u < 2; u++) {
+        int base = u ? 0x8000 : 0x4000, len = u ? 0x8000 : 0x4000;
+        if (u && (z->ram16k || z->uram_part[0] < 0)) {
+            memset(z->fast_ram + base, 0xFF, (size_t)len);
+            continue;
+        }
+        const uint8_t *cells[8];
+        for (int bit = 0; bit < 8; bit++)
+            cells[bit] = ((const dram_state_t *)s->parts[u ? z->uram_part[bit] : z->lram_part[bit]].state)->cells;
+        for (int hi_a = base >> 8; hi_a < (base + len) >> 8; hi_a++) {
+            uint16_t hi_c = z->ram_hi_lut[u][hi_a];
+            uint8_t *dst = &z->fast_ram[hi_a << 8];
+            for (int lo_a = 0; lo_a < 256; lo_a++) {
+                uint16_t cell = hi_c | z->ram_lo_lut[u][lo_a];
+                dst[lo_a] = (uint8_t)(cells[0][cell] | (cells[1][cell] << 1) | (cells[2][cell] << 2) |
+                                      (cells[3][cell] << 3) | (cells[4][cell] << 4) | (cells[5][cell] << 5) |
+                                      (cells[6][cell] << 6) | (cells[7][cell] << 7));
+            }
+        }
+    }
+}
+
+static void zx_sync_to_netlist(board_t *b) {
+    zx48_t *z = ZX(b);
+    sim_t *s = &b->sim;
+    if (z->fast_dirty_pages) zx_sync_to_dram(b);
+    ula_state_t *u = s->parts[z->p_ula].state;
+    unsigned c = u->c, blk = c & 15;
+    bool screen = (c < 256 && u->v < 192);
+    u->cas = false;
+    u->ras = screen && blk >= 8 && (blk & 3) == 2;
+    u->ae = (u->v < 192 && c > 0 && c <= 256 && blk == 0) || (screen && blk >= 8);
+    if (screen && blk >= 8) {
+        unsigned cell_k = ((c >> 4) << 1) | (blk >= 12);
+        u->addr = (uint8_t)(((blk & 3) == 0) ? (zx_bitmap_addr(u->v, cell_k) & 0x7F) : (zx_bitmap_addr(u->v, cell_k) >> 7));
+    }
+    uint64_t pins = z->cpu_pins;
+    bool aoe = (pins & Z80_AOE) != 0;
+    uint16_t a = aoe ? Z80_GET_ADDR(pins) : 0xFFFF;
+    bool mreq = aoe && (pins & Z80_MREQ) != 0;
+    bool rd = aoe && (pins & Z80_RD) != 0;
+    bool wr = aoe && (pins & Z80_WR) != 0;
+    bool lram_act = mreq && (rd || wr) && a >= 0x4000 && a < 0x8000;
+    bool lram_rd = lram_act && rd;
+    bool uram_act = mreq && (rd || wr) && a >= 0x8000 && !z->ram16k && z->uram_part[0] >= 0;
+    bool uram_rd = uram_act && rd;
+    rom23128_state_t *rom_st = s->parts[z->p_rom].state;
+    rom_st->addr = a & 0x3FFF;
+    rom_st->ce_prev = !mreq;
+    uint8_t lv = lram_rd ? z->fast_ram[a] : 0, uv = uram_rd ? z->fast_ram[a] : 0;
+    for (int bit = 0; bit < 8; bit++) {
+        if (z->lram_part[bit] >= 0) {
+            dram_state_t *dst = s->parts[z->lram_part[bit]].state;
+            dst->out_en = lram_rd;
+            dst->out_bit = (lv >> bit) & 1;
+            dst->ras_prev = 0;
+            dst->cas_prev = 0;
+            sim_mark_dirty(s, z->lram_part[bit]);
+        }
+        if (!z->ram16k && z->uram_part[bit] >= 0) {
+            dram_state_t *dst = s->parts[z->uram_part[bit]].state;
+            dst->out_en = uram_rd;
+            dst->out_bit = (uv >> bit) & 1;
+            dst->ras_prev = 0;
+            dst->cas_prev = 0;
+            sim_mark_dirty(s, z->uram_part[bit]);
+        }
+    }
+    sim_mark_dirty(s, z->p_cpu);
+    sim_mark_dirty(s, z->p_ula);
+    sim_mark_dirty(s, z->p_rom);
+    sim_settle(s);
+    sim_commit(s);
+    sim_settle(s);
+    for (int bit = 0; bit < 8; bit++) {
+        if (z->lram_part[bit] >= 0) {
+            dram_state_t *dst = s->parts[z->lram_part[bit]].state;
+            dst->out_en = lram_rd;
+            dst->out_bit = (lv >> bit) & 1;
+            dst->ras_prev = !(lram_act || u->ras);
+            dst->cas_prev = !lram_act;
+            sim_mark_dirty(s, z->lram_part[bit]);
+        }
+        if (!z->ram16k && z->uram_part[bit] >= 0) {
+            dram_state_t *dst = s->parts[z->uram_part[bit]].state;
+            dst->out_en = uram_rd;
+            dst->out_bit = (uv >> bit) & 1;
+            dst->ras_prev = !mreq;
+            dst->cas_prev = !uram_act;
+            sim_mark_dirty(s, z->uram_part[bit]);
+        }
+    }
+    rom_st->addr = a & 0x3FFF;
+    rom_st->ce_prev = !mreq;
+    sim_settle(s);
+    z->changes_seen = s->changes;
 }
 
 /* Start the CPU at pc with the registers of a snapshot. */
@@ -1162,17 +1598,6 @@ static bool load_z80(board_t *b, const uint8_t *d, size_t n, char *msg, int msgl
  * 2026-11-09): an LS138 on /IORQ, /WR and A5-A7 latches a write to any of
  * ports 00-1F; its bit 5 set releases /ROMCS and the data bus (the
  * Spectrum's own ROM is seen), clear takes them again. /RESET pages in. */
-#define ZX_MAX_BANKS 16
-typedef struct {
-    char name[64];
-    uint8_t rom[16384];         /* the selected bank */
-    int pin_romcs, pin_mreq, pin_rd, pin_a[16], pin_d[8];
-    int pin_iorq, pin_wr, pin_reset;
-    bool out;                   /* paged out (port 1F, bit 5) */
-    int nbanks, bank;
-    uint8_t image[];            /* nbanks * 16K */
-} zxcart_t;
-
 static void zxcart_eval(sim_t *s, part_t *p) {
     zxcart_t *c = p->state;
     if (c->pin_reset >= 0 && !sim_read(s, c->pin_reset)) c->out = false;
@@ -1348,6 +1773,9 @@ static void zx_rom_pin_names(board_t *b);
 
 static void zx_state_loaded(board_t *b, const board_t *before) {
     for (int u = 0; u < 2; u++) ZX(b)->ram_cells[u] = ((const zx48_t *)before)->ram_cells[u];
+    ZX(b)->fast_epoch = 0;
+    ZX(b)->fast_dirty_pages = 0;
+    ZX(b)->fast_active = false;
     zx_rom_pin_names(b);
 }
 

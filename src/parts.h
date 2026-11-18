@@ -88,6 +88,7 @@ static inline void part_drive_bus_cached(sim_t *s, part_t *p, const int *pins, i
 
 /* ROM state: the image the ROM contains. */
 typedef struct { const uint8_t *data; int32_t out_cache; } rom_state_t;
+typedef struct { rom_state_t rom; uint16_t addr; uint8_t ce_prev; } rom23128_state_t;
 /* DRAM state: one byte per bit cell (simple, not compact). */
 typedef struct {
     uint8_t cells[65536];

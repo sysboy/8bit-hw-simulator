@@ -690,7 +690,6 @@ bool part_is_dram64(const part_t *p) {
  * state, so the option can swap them (zx48.c). */
 static const int rom23128_addr_pins[14] = { 10, 9, 8, 7, 6, 5, 4, 3, 25, 24, 21, 23, 2, 26 };
 static const int rom23128_data_pins[8] = { 11, 12, 13, 15, 16, 17, 18, 19 };
-typedef struct { rom_state_t rom; uint16_t addr; uint8_t ce_prev; } rom23128_state_t;
 static void hn613128_eval(sim_t *s, part_t *p) {
     rom23128_state_t *st = p->state;
     bool selected = !pin_in(s, p, 20) && !pin_in(s, p, 22) && !pin_in(s, p, 27);

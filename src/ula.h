@@ -45,9 +45,12 @@ typedef struct {
     bool mic_reads_ear;
     uint32_t inputs;
     uint8_t pix;                    /* the colour of the last pixel (bit 3 bright) */
+    int32_t addr_cache, data_cache;
+    bool in_mreq, in_iorq, in_rd, in_wr, in_a14, in_a15;
 } ula_state_t;
 
 extern const part_type_t PT_ULA;
+extern const uint32_t ula_palette[16];
 /* One half period of the 14 MHz oscillator (8 per CPU T-state). The part
  * is marked dirty when its outputs change. */
 void ula_step(sim_t *s, part_t *p);

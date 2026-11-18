@@ -53,6 +53,12 @@ typedef struct zx48 {
     /* The ROM: which chip (0 NEC uPD23128, 1 Hitachi HN613128) and how
      * its link is set (0 N, 1 H): zx_rom_fitted(). */
     int rom_chip, rom_link;
+    /* Fast-path RAM cache and wiring LUTs for healthy boards. */
+    uint32_t fast_epoch;
+    bool fast_ok, fast_active, has_tr6;
+    uint64_t fast_dirty_pages;
+    uint16_t ram_lo_lut[2][256], ram_hi_lut[2][256];
+    uint8_t fast_ram[65536];
 } zx48_t;
 
 static inline zx48_t *ZX(board_t *b) { return (zx48_t *)b; }
