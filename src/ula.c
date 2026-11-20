@@ -119,7 +119,7 @@ static void ula_eval(sim_t *s, part_t *p) {
      * themselves: the Issue 1 has no R73 (through D14 and R24 they drive
      * TR3's base). */
     pin_out(s, p, P_PHICPU, u->cpuclk ? DRV_LO : u->clk_pulls_up ? DRIVE(S_RES, 1) : DRV_Z);
-    part_drive_bus(s, p, addr_pins, 7, u->addr, u->ae);
+    part_drive_bus_cached(s, p, addr_pins, 7, u->addr, u->ae, &u->addr_cache);
     /* The SOUND pin: the speaker bit (an analog level on the real chip: the
      * MIC bit only moves it a little). The EAR input is the same pin, read
      * by a comparator: it reads back the speaker bit, and on the Issue 1
@@ -134,7 +134,10 @@ static void ula_eval(sim_t *s, part_t *p) {
         for (int i = 0; i < 5; i++) if (!pin_in(s, p, kb_pins[i])) low |= (uint8_t)(1 << i);
         if (!u->ear_in && !pin_in(s, p, P_SOUND)) low |= 0x40;
     }
-    for (int i = 0; i < 8; i++) pin_out(s, p, data_pins[i], (low >> i) & 1 ? DRV_LO : DRV_Z);
+    if (u->data_cache != (int32_t)low + 1) {
+        u->data_cache = (int32_t)low + 1;
+        for (int i = 0; i < 8; i++) pin_out(s, p, data_pins[i], (low >> i) & 1 ? DRV_LO : DRV_Z);
+    }
     u->dlow = low;      /* only for ula_log() */
 }
 

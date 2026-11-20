@@ -73,16 +73,25 @@ unsigned superpla_read_inputs(sim_t *s, part_t *p);
 /* Attach a type to a part: pin names/flags, functions, state. */
 void part_set_type(sim_t *s, int part, const part_type_t *t);
 /* Read/drive a group of pins as a binary number (pins[0] is bit 0). */
-unsigned part_read_bus(sim_t *s, part_t *p, const int *pins, int n);
+static inline unsigned part_read_bus(sim_t *s, part_t *p, const int *pins, int n) {
+    return sim_read_group(s, p, pins, n);
+}
 void part_drive_bus(sim_t *s, part_t *p, const int *pins, int n, unsigned v, bool enable);
 /* Same, but does nothing if value and enable are the same as the last time
- * this cache was used. A pure speed-up: sim_drive() would ignore unchanged
- * drives anyway, one pin at a time. A zeroed cache means "unknown". */
+ * this cache was used. When already enabled, only pins whose bit changed
+ * in (v ^ old_v) are visited. A zeroed cache means "unknown". */
 static inline void part_drive_bus_cached(sim_t *s, part_t *p, const int *pins, int n,
                                          unsigned v, bool enable, int32_t *cache) {
-    int32_t key = enable ? (int32_t)v + 1 : -1;
-    if (*cache == key) return;
+    int32_t old = *cache, key = enable ? (int32_t)v + 1 : -1;
+    if (old == key) return;
     *cache = key;
+    if (__builtin_expect(old > 0 && enable && (unsigned)(old - 1) < (1u << n), 1)) {
+        for (unsigned diff = v ^ (unsigned)(old - 1); diff; diff &= diff - 1) {
+            int i = __builtin_ctz(diff);
+            pin_out(s, p, pins[i], DRV_BIT((v >> i) & 1));
+        }
+        return;
+    }
     part_drive_bus(s, p, pins, n, v, enable);
 }
 
@@ -133,7 +142,13 @@ typedef struct { bool crystal_ok; } vco_state_t;
  *   ANALOG           not simulated */
 enum { EL_PULLUP, EL_PULLDOWN, EL_LINK, EL_ANALOG, EL_SERIES, EL_DIODE, EL_DELAY, EL_NPN, EL_FOLLOWER };
 typedef struct { int pin_a, pin_b, type; } element_t;
-typedef struct { element_t el[16]; int nel; uint8_t delayed[16]; } resistor_state_t;
+typedef struct {
+    element_t el[16];
+    int nel;
+    uint8_t delayed[16];
+    uint32_t epoch;
+    uint8_t off;
+} resistor_state_t;
 void resistor_eval(sim_t *s, part_t *p);
 void resistor_commit(sim_t *s, part_t *p);
 /* Make an element one of the active kinds above (sets pin flags, eval and

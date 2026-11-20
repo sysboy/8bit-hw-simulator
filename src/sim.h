@@ -159,6 +159,8 @@ typedef struct {
     int n;              /* and its length */
     uint32_t epoch;     /* rebuild epoch the cache was computed in */
     int first;          /* bus bitmap bit of the group's first pin, or -1 */
+    int8_t fast_roots;  /* 1 if roots[0..n-1] are valid non-open nets */
+    int16_t roots[16];  /* root net of each pin when n <= 16 */
     uint64_t mask, ttl; /* group bits / TTL inputs, shifted to bit 0 */
 } group_t;
 
@@ -305,14 +307,36 @@ static inline int sim_read(sim_t *s, int pin) {
 
 /* Read a group of pins of a part (pin numbers in 'numbers', bit 0 first)
  * as a binary number. Same result as reading them one by one. */
-unsigned sim_read_group(sim_t *s, part_t *p, const int *numbers, int n);
+unsigned sim_read_group_slow(sim_t *s, part_t *p, const int *numbers, int n);
+static inline unsigned sim_read_group(sim_t *s, part_t *p, const int *numbers, int n) {
+    group_t *g = &p->groups[0];
+    if (__builtin_expect(g->key == numbers && g->epoch == s->epoch && g->first >= 0 && g->n == n, 1)) {
+        uint64_t level = s->bus_level >> g->first, floating = s->bus_float >> g->first;
+        if (__builtin_expect(!((s->bus_erratic >> g->first) & g->mask & ~g->ttl), 1))
+            return (unsigned)((level & g->mask) | (floating & g->ttl));
+    }
+    return sim_read_group_slow(s, p, numbers, n);
+}
 
 /* Combine the drives on a net, given as a 'kinds' bitmask (bit d: at least
  * one drive d): the strongest wins, equal ones fighting produce a
  * contention where low wins. A drive_t orders by strength first, so the
  * strongest drive present is the highest bit: no need to scan the
- * strengths one by one, whatever drives the net. */
+ * strengths one by one, whatever drives the net.
+ * A 1024-entry lookup table is used for the common domain (kinds < 1024). */
+typedef struct {
+    uint8_t drive;
+    uint8_t contention;
+} sim_combine_lut_t;
+
+extern const sim_combine_lut_t sim_combine_table[1024];
+
 static inline drive_t sim_combine(unsigned kinds, int *contention) {
+    if (__builtin_expect(kinds < 1024, 1)) {
+        sim_combine_lut_t e = sim_combine_table[kinds];
+        *contention = e.contention;
+        return e.drive;
+    }
     if (!kinds) { *contention = 0; return DRV_Z; }
     int st = (31 - __builtin_clz(kinds)) >> 1;
     unsigned lo = 1u << DRIVE(st, 0), both = lo | lo << 1;
@@ -328,8 +352,9 @@ static inline drive_t sim_drive_others(const sim_t *s, int pin) {
     const net_t *n = &s->nets[p->root];
     unsigned kinds = n->kinds;
     if ((p->eff >> 1) && n->count[p->eff] == 1) kinds &= ~(1u << p->eff);
-    int contention;
-    return sim_combine(kinds, &contention);
+    if (!kinds) return DRV_Z;
+    int st = (31 - __builtin_clz(kinds)) >> 1;
+    return DRIVE(st, !(kinds & (1u << DRIVE(st, 0))));
 }
 
 /* Change a pin fault (the caller must sim_rebuild() afterwards). An opened

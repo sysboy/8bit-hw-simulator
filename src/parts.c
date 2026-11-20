@@ -55,10 +55,6 @@ void part_set_type(sim_t *s, int part, const part_type_t *t) {
     free(copy);
 }
 
-unsigned part_read_bus(sim_t *s, part_t *p, const int *pins, int n) {
-    return sim_read_group(s, p, pins, n);
-}
-
 void part_drive_bus(sim_t *s, part_t *p, const int *pins, int n, unsigned v, bool enable) {
     for (int i = 0; i < n; i++)
         pin_out(s, p, pins[i], enable ? DRV_BIT((v >> i) & 1) : DRV_Z);
@@ -164,9 +160,30 @@ const pla_term_t pla_terms[] = {
 };
 const int pla_nterms = sizeof(pla_terms) / sizeof(pla_terms[0]);
 
+typedef struct {
+    uint32_t epoch;
+    uint16_t open_mask;
+    int16_t root[PLA_NIN];
+    int32_t out_cache;
+} pla_state_t;
+
 unsigned pla_read_inputs(sim_t *s, part_t *p) {
-    unsigned in = 0;
-    for (int k = 0; k < PLA_NIN; k++) in |= (unsigned)pin_in(s, p, pla_in_pin[k]) << k;
+    pla_state_t *st = p->state;
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        st->epoch = s->epoch;
+        st->open_mask = 0;
+        for (int k = 0; k < PLA_NIN; k++) {
+            int pi = p->pinmap[pla_in_pin[k]];
+            if (pi < 0 || s->pins[pi].fault == PF_OPEN || s->pins[pi].root < 0) {
+                st->open_mask |= (uint16_t)(1u << k);
+                st->root[k] = 0;
+            } else {
+                st->root[k] = s->pins[pi].root;
+            }
+        }
+    }
+    unsigned in = st->open_mask;
+    for (int k = 0; k < PLA_NIN; k++) in |= (unsigned)(s->nread[st->root[k]] != 0) << k;
     return in;
 }
 
@@ -194,16 +211,16 @@ unsigned pla_logic(unsigned in) {
 }
 
 static void pla_eval(sim_t *s, part_t *p) {
-    unsigned out = pla_logic(pla_read_inputs(s, p));
+    pla_state_t *st = p->state;
     bool en = !pin_in(s, p, 19);            /* /OE, tied to GND */
-    for (int k = 0; k < PLA_NOUT; k++)
-        pin_out(s, p, pla_out_pin[k], en ? DRV_BIT((out >> k) & 1) : DRV_Z);
+    unsigned out = en ? pla_logic(pla_read_inputs(s, p)) : 0;
+    part_drive_bus_cached(s, p, pla_out_pin, PLA_NOUT, out, en, &st->out_cache);
 }
 
 const part_type_t PT_82S100 = { "82S100 PLA",
     "FE:O A13:T A14:T A15:T /VA14:T /CHAREN:T /HIRAM:T /LORAM:T /CAS:T /ROMH:O /ROML:O "
     "/IO:O GR/W:O GND:P /CHAROM:O /KERNAL:O /BASIC:O /CASRAM:O /OE:T VA12:T VA13:T "
-    "/GAME:T /EXROM:T R/W:T /AEC:T BA:T A12:T VCC:P", pla_eval, 0, 0, 0, TECH_TTL };
+    "/GAME:T /EXROM:T R/W:T /AEC:T BA:T A12:T VCC:P", pla_eval, 0, 0, sizeof(pla_state_t), TECH_TTL };
 
 /* ------------------------------------------------------------------------ */
 /* Memory faults (part_t.mfault, see sim.h)                                  */
@@ -321,6 +338,7 @@ enum {
 static void dram_cycle(sim_t *s, part_t *p, int bits, int half) {
     dram_state_t *st = p->state;
     int ras = pin_in(s, p, 4), cas = pin_in(s, p, 15);
+    if (ras == st->ras_prev && cas == st->cas_prev) return;
     uint8_t out_en = st->out_en, out_bit = st->out_bit;
     /* A dead address line inside the chip is dead for the row and the
      * column alike: they come in through the same buffer. */
@@ -372,62 +390,91 @@ const part_type_t PT_4164 = { "4164",
 /* TTL glue                                                                  */
 /* ------------------------------------------------------------------------ */
 
+typedef struct { uint8_t cache[4]; } quad_gate_state_t;
+typedef struct { uint8_t cache[6]; } hex_inv_state_t;
+typedef struct { int16_t cache[2]; } ls139_state_t;
+typedef struct { int32_t cache; } ttl_mux_state_t;
+
 /* 74LS08: quad 2-input AND. */
 static void ls08_eval(sim_t *s, part_t *p) {
     static const int g[4][3] = { {1, 2, 3}, {4, 5, 6}, {9, 10, 8}, {12, 13, 11} };
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, g[i][2], DRV_BIT(pin_in(s, p, g[i][0]) && pin_in(s, p, g[i][1])));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        int in1 = pin_in(s, p, g[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][2], DRV_BIT(in0 && in1));
+    }
 }
 const part_type_t PT_74LS08 = { "74LS08",
     "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P",
-    ls08_eval, 0, 0, 0, TECH_TTL };
+    ls08_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 
 /* 7406: hex inverter with open collector outputs: it can only pull low. */
 static void ls06_eval(sim_t *s, part_t *p) {
     static const int g[6][2] = { {1, 2}, {3, 4}, {5, 6}, {9, 8}, {11, 10}, {13, 12} };
-    for (int i = 0; i < 6; i++)
-        pin_out(s, p, g[i][1], pin_in(s, p, g[i][0]) ? DRV_LO : DRV_Z);
+    hex_inv_state_t *st = p->state;
+    for (int i = 0; i < 6; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        uint8_t key = (uint8_t)(in0 + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][1], in0 ? DRV_LO : DRV_Z);
+    }
 }
 const part_type_t PT_7406 = { "7406",
     "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P",
-    ls06_eval, 0, 0, 0, TECH_TTL_OC };
+    ls06_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL_OC };
 
 /* 74LS139: dual 2-to-4 decoder, active low outputs. */
 static void ls139_eval(sim_t *s, part_t *p) {
     static const int half[2][7] = { {1, 2, 3, 4, 5, 6, 7}, {15, 14, 13, 12, 11, 10, 9} };
+    ls139_state_t *st = p->state;
     for (int h = 0; h < 2; h++) {
         const int *pin = half[h];
         bool enabled = !pin_in(s, p, pin[0]);
-        int sel = pin_in(s, p, pin[1]) | (pin_in(s, p, pin[2]) << 1);
+        int sel = enabled ? (pin_in(s, p, pin[1]) | (pin_in(s, p, pin[2]) << 1)) : -1;
+        int16_t key = (int16_t)(sel + 2);
+        if (st->cache[h] == key) continue;
+        st->cache[h] = key;
         for (int y = 0; y < 4; y++) pin_out(s, p, pin[3 + y], DRV_BIT(!(enabled && sel == y)));
     }
 }
 const part_type_t PT_74LS139 = { "74LS139",
     "1/G:T 1A:T 1B:T 1Y0:O 1Y1:O 1Y2:O 1Y3:O GND:P 2Y3:O 2Y2:O 2Y1:O 2Y0:O 2B:T 2A:T "
-    "2/G:T VCC:P", ls139_eval, 0, 0, 0, TECH_TTL };
+    "2/G:T VCC:P", ls139_eval, 0, 0, sizeof(ls139_state_t), TECH_TTL };
 
 /* 74LS257 / 74LS258: quad 2-to-1 multiplexer (258 has inverted outputs).
  * S low selects the A inputs, S high selects B. /G high: outputs off. */
 static void mux_eval(sim_t *s, part_t *p, bool invert) {
     static const int sec[4][3] = { {2, 3, 4}, {5, 6, 7}, {11, 10, 9}, {14, 13, 12} };
     static const int outputs[4] = { 4, 7, 9, 12 };
+    ttl_mux_state_t *st = p->state;
     bool enabled = !pin_in(s, p, 15);
+    if (!enabled) {
+        part_drive_bus_cached(s, p, outputs, 4, 0, false, &st->cache);
+        return;
+    }
     int sel = pin_in(s, p, 1);
     unsigned v = 0;
     for (int i = 0; i < 4; i++) v |= (unsigned)(pin_in(s, p, sel ? sec[i][1] : sec[i][0]) ^ invert) << i;
-    part_drive_bus(s, p, outputs, 4, v, enabled);
+    part_drive_bus_cached(s, p, outputs, 4, v, true, &st->cache);
 }
 static void ls257_eval(sim_t *s, part_t *p) { mux_eval(s, p, false); }
 static void ls258_eval(sim_t *s, part_t *p) { mux_eval(s, p, true); }
 #define MUX_PINS "S:T 1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3B:T 3A:T 4Y:O 4B:T 4A:T /G:T VCC:P"
-const part_type_t PT_74LS257 = { "74LS257", MUX_PINS, ls257_eval, 0, 0, 0, TECH_TTL };
-const part_type_t PT_74LS258 = { "74LS258", MUX_PINS, ls258_eval, 0, 0, 0, TECH_TTL };
+const part_type_t PT_74LS257 = { "74LS257", MUX_PINS, ls257_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
+const part_type_t PT_74LS258 = { "74LS258", MUX_PINS, ls258_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
 
 /* 74LS373: octal transparent latch. While LE is high the outputs follow the
- * inputs; when LE goes low the last value is held. /OE high: outputs off. */
+ * inputs; when LE goes low the last value is held. /OE high: outputs off.
+ * Sections ordered as U26 sits on VA0-VA7, so part_read_bus() hits the bus
+ * bitmap. */
 typedef struct { uint8_t latch; int32_t out_cache; } ls373_state_t;
-static const int ls373_d[8] = { 3, 4, 7, 8, 13, 14, 17, 18 };
-static const int ls373_q[8] = { 2, 5, 6, 9, 12, 15, 16, 19 };
+static const int ls373_d[8] = { 7, 13, 8, 14, 17, 18, 4, 3 };
+static const int ls373_q[8] = { 6, 12, 9, 15, 16, 19, 5, 2 };
 
 static void ls373_eval(sim_t *s, part_t *p) {
     ls373_state_t *st = p->state;
@@ -446,17 +493,35 @@ const part_type_t PT_74LS373 = { "74LS373",
 /* 4066: four bidirectional analog switches. When a switch is on, each side
  * gets whatever drives the other side (excluding the switch itself), so a
  * signal passes through in either direction. */
+typedef struct {
+    uint32_t epoch;
+    int16_t pin_a[4], pin_b[4], pin_c[4];
+    uint8_t was_on[4];
+} cd4066_state_t;
+
 static void cd4066_eval(sim_t *s, part_t *p) {
-    static const int sw[4][3] = { {1, 2, 13}, {4, 3, 5}, {8, 9, 6}, {11, 10, 12} };
+    cd4066_state_t *st = p->state;
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        static const int sw[4][3] = { {1, 2, 13}, {4, 3, 5}, {8, 9, 6}, {11, 10, 12} };
+        st->epoch = s->epoch;
+        for (int i = 0; i < 4; i++) {
+            st->pin_a[i] = (int16_t)part_pin(p, sw[i][0]);
+            st->pin_b[i] = (int16_t)part_pin(p, sw[i][1]);
+            st->pin_c[i] = (int16_t)part_pin(p, sw[i][2]);
+            st->was_on[i] = 1;
+        }
+    }
     for (int i = 0; i < 4; i++) {
-        int a = part_pin(p, sw[i][0]), b = part_pin(p, sw[i][1]);
+        int a = st->pin_a[i], b = st->pin_b[i];
         if (a < 0 || b < 0) continue;
-        if (pin_in(s, p, sw[i][2])) {
+        if (sim_read(s, st->pin_c[i])) {
+            st->was_on[i] = 1;
             drive_t from_a = sim_drive_others(s, a);
             drive_t from_b = sim_drive_others(s, b);
             sim_drive(s, a, from_b);
             sim_drive(s, b, from_a);
-        } else {
+        } else if (st->was_on[i]) {
+            st->was_on[i] = 0;
             sim_drive(s, a, DRV_Z);
             sim_drive(s, b, DRV_Z);
         }
@@ -464,7 +529,7 @@ static void cd4066_eval(sim_t *s, part_t *p) {
 }
 const part_type_t PT_4066 = { "4066",
     "1A:S 1B:S 2B:S 2A:S C2:M C3:M VSS:P 3A:S 3B:S 4B:S 4A:S C4:M C1:M VDD:P",
-    cd4066_eval, 0, 0, 0, TECH_CMOS };
+    cd4066_eval, 0, 0, sizeof(cd4066_state_t), TECH_CMOS };
 
 /* 556 dual timer (U20), modeled by what it does on the C64:
  *  - timer 2: holds the system in reset for a while after power-on (OUT2
@@ -537,12 +602,71 @@ const part_type_t PT_MC4044 = { "MC4044 PLL",
 /* What a series resistor passes from one side to the other: the drive on
  * that side (its own drive excluded), one step weaker. Through two
  * resistors a chip output is only as strong as a pull-up. */
+static inline drive_t through_fast(const net_t *n, drive_t eff) {
+    unsigned kinds = n->kinds;
+    if (kinds >= (1u << DRIVE(S_STRONG, 0)) && kinds < (1u << DRIVE(S_SUPPLY, 0)) && eff < DRIVE(S_STRONG, 0))
+        return DRIVE(S_RES, !(kinds & (1u << DRIVE(S_STRONG, 0))));
+    if ((eff >> 1) && n->count[eff] == 1) kinds &= ~(1u << eff);
+    if (!kinds) return DRV_Z;
+    int st = (31 - __builtin_clz(kinds)) >> 1;
+    return DRIVE(st >= S_STRONG ? S_RES : S_PULL, !(kinds & (1u << DRIVE(st, 0))));
+}
+
 static drive_t through(sim_t *s, int pin) {
-    drive_t d = sim_drive_others(s, pin);
-    int st = d >> 1;
-    if (st >= S_STRONG) return DRIVE(S_RES, d & 1);
-    if (st >= S_PULL) return DRIVE(S_PULL, d & 1);
-    return DRV_Z;
+    const pin_t *p = &s->pins[pin];
+    if (p->root < 0 || p->fault == PF_OPEN) return DRV_Z;
+    return through_fast(&s->nets[p->root], p->eff);
+}
+
+static void series_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        st->epoch = s->epoch;
+        st->off = p->rfault != RF_OK || a->root < 0 || b->root < 0 || a->root == b->root ||
+                  a->fault == PF_OPEN || b->fault == PF_OPEN;
+    }
+    if (__builtin_expect(st->off, 0)) {
+        sim_drive(s, e->pin_b, DRV_Z);
+        sim_drive(s, e->pin_a, DRV_Z);
+        return;
+    }
+    drive_t da = through_fast(&s->nets[a->root], a->eff);
+    drive_t db = through_fast(&s->nets[b->root], b->eff);
+    sim_drive(s, e->pin_b, da);
+    sim_drive(s, e->pin_a, db);
+}
+
+static void diode_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *k = &s->pins[e->pin_b];
+    bool on = p->rfault == RF_OK && k->root >= 0 && k->fault != PF_OPEN &&
+              s->nets[k->root].strength != S_Z && !s->nets[k->root].level;
+    if (__builtin_expect(p->rfault == RF_SHORT, 0)) on = k->root >= 0 && !s->nets[k->root].level;
+    sim_drive(s, e->pin_a, on ? DRIVE(S_RES, 0) : DRV_Z);
+}
+
+static void delay_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    sim_drive(s, st->el[0].pin_b, p->rfault != RF_OK ? DRV_Z : DRV_BIT(st->delayed[0]));
+}
+
+static void delay_commit(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    uint8_t v = (uint8_t)sim_read(s, st->el[0].pin_a);
+    if (v != st->delayed[0]) { st->delayed[0] = v; sim_mark_dirty(s, (int)(p - s->parts)); }
+}
+
+static void transistor_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *bp = &s->pins[e->pin_a];
+    bool on = p->rfault == RF_SHORT ||
+              (p->rfault == RF_OK && bp->root >= 0 && bp->fault != PF_OPEN &&
+               s->nets[bp->root].strength != S_Z && s->nets[bp->root].level);
+    sim_drive(s, e->pin_b, !on ? DRV_Z : e->type == EL_NPN ? DRV_LO : DRV_HI);
 }
 
 void resistor_eval(sim_t *s, part_t *p) {
@@ -616,26 +740,31 @@ void element_set_type(sim_t *s, part_t *p, int index, int type) {
     element_t *e = &st->el[index];
     e->type = type;
     pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    bool single = st->nel == 1 && index == 0;
+    p->eval = resistor_eval;
     switch (type) {
     case EL_SERIES:     /* re-evaluated when anything on either side changes */
         a->flags = b->flags = PIN_SENSE | PIN_SWITCH | PIN_IN | PIN_OUT;
+        if (single) p->eval = series_eval;
         break;
     case EL_DIODE:
         a->flags = PIN_OUT;
         b->flags = PIN_SENSE | PIN_IN;
+        if (single) p->eval = diode_eval;
         break;
     case EL_NPN:
     case EL_FOLLOWER:
         a->flags = PIN_SENSE | PIN_IN;
         b->flags = PIN_OUT;
+        if (single) p->eval = transistor_eval;
         break;
     case EL_DELAY:
         a->flags = PIN_IN;
         b->flags = PIN_OUT;
-        p->commit = resistor_commit;
+        p->eval = single ? delay_eval : resistor_eval;
+        p->commit = single ? delay_commit : resistor_commit;
         break;
     }
-    p->eval = resistor_eval;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -731,35 +860,70 @@ const part_type_t PT_HN613128 = { "HN613128 ROM", ROM23128_PINS("CS", "OE0", "OE
  * /G high the outputs are low (not off, unlike the 74LS257). */
 static void ls157_eval(sim_t *s, part_t *p) {
     static const int sec[4][3] = { {2, 3, 4}, {5, 6, 7}, {11, 10, 9}, {14, 13, 12} };
+    static const int outputs[4] = { 4, 7, 9, 12 };
+    ttl_mux_state_t *st = p->state;
     bool enabled = !pin_in(s, p, 15);
+    if (!enabled) {
+        if (st->cache == 1) return;
+        st->cache = 1;
+        for (int i = 0; i < 4; i++) pin_out(s, p, outputs[i], DRV_LO);
+        return;
+    }
     int sel = pin_in(s, p, 1);
+    unsigned v = 0;
     for (int i = 0; i < 4; i++)
-        pin_out(s, p, sec[i][2], DRV_BIT(enabled && pin_in(s, p, sel ? sec[i][1] : sec[i][0])));
+        v |= (unsigned)pin_in(s, p, sel ? sec[i][1] : sec[i][0]) << i;
+    int32_t key = (int32_t)v + 2;
+    if (st->cache == key) return;
+    st->cache = key;
+    for (int i = 0; i < 4; i++)
+        pin_out(s, p, outputs[i], DRV_BIT((v >> i) & 1));
 }
-const part_type_t PT_74LS157 = { "74LS157", MUX_PINS, ls157_eval, 0, 0, 0, TECH_TTL };
+const part_type_t PT_74LS157 = { "74LS157", MUX_PINS, ls157_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
 
 /* 74LS32: quad 2-input OR. 74LS00: quad 2-input NAND. */
 static const int quad_gates[4][3] = { {1, 2, 3}, {4, 5, 6}, {9, 10, 8}, {12, 13, 11} };
 static void ls32_eval(sim_t *s, part_t *p) {
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, quad_gates[i][2], DRV_BIT(pin_in(s, p, quad_gates[i][0]) || pin_in(s, p, quad_gates[i][1])));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, quad_gates[i][0]);
+        int in1 = pin_in(s, p, quad_gates[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, quad_gates[i][2], DRV_BIT(in0 || in1));
+    }
 }
 static void ls00_eval(sim_t *s, part_t *p) {
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, quad_gates[i][2], DRV_BIT(!(pin_in(s, p, quad_gates[i][0]) && pin_in(s, p, quad_gates[i][1]))));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, quad_gates[i][0]);
+        int in1 = pin_in(s, p, quad_gates[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, quad_gates[i][2], DRV_BIT(!(in0 && in1)));
+    }
 }
 const part_type_t PT_74LS32 = { "74LS32",
-    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls32_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls32_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 const part_type_t PT_74LS00 = { "74LS00",
-    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls00_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls00_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 
 /* 74LS04: hex inverter. */
 static void ls04_eval(sim_t *s, part_t *p) {
     static const int g[6][2] = { {1, 2}, {3, 4}, {5, 6}, {9, 8}, {11, 10}, {13, 12} };
-    for (int i = 0; i < 6; i++) pin_out(s, p, g[i][1], DRV_BIT(!pin_in(s, p, g[i][0])));
+    hex_inv_state_t *st = p->state;
+    for (int i = 0; i < 6; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        uint8_t key = (uint8_t)(in0 + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][1], DRV_BIT(!in0));
+    }
 }
 const part_type_t PT_74LS04 = { "74LS04",
-    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL };
 
 /* ZX8401 (Philips PCF1306P): the Issue 6A's glue in one chip, the 4B's
  * IC3, IC4 and IC23-IC26 as a drop-in replacement made of 74LS parts
@@ -831,6 +995,7 @@ static void d41464_eval(sim_t *s, part_t *p) {
 static void d41464_commit(sim_t *s, part_t *p) {
     dram4_state_t *st = p->state;
     int ras = pin_in(s, p, 5), cas = pin_in(s, p, 16);
+    if (ras == st->ras_prev && cas == st->cas_prev) return;
     uint8_t out_en = st->out_en, out_val = st->out_val;
     if (st->ras_prev && !ras) st->row = (uint8_t)mem_addr(p, part_read_bus(s, p, d41464_addr_pins, 8));
     if (st->cas_prev && !cas && !ras) {
@@ -883,7 +1048,7 @@ const part_type_t PT_27128 = { "27128 EPROM",
 /* 74LS14: hex Schmitt trigger inverter (the analog side of its inputs,
  * the reset RC and the mains, is not simulated: see c64.c). */
 const part_type_t PT_74LS14 = { "74LS14",
-    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL };
 
 /* MOS 8701 clock generator (U20): with the crystal Y1 it makes the color
  * clock (pin 8) and, divided down, the dot clock (pin 6) for the VIC.
@@ -939,7 +1104,7 @@ enum { SPLA_A13 = 1, SPLA_A14, SPLA_A15, SPLA_RW, SPLA_LORAM, SPLA_HIRAM, SPLA_C
        SPLA_SID, SPLA_ROML, SPLA_IO2, SPLA_EXROM, SPLA_GAME, SPLA_IO1 = 49, SPLA_ROMH };
 static const int spla_ma[8] = { 26, 29, 27, 25, 28, 30, 24, 31 };         /* MA0-MA7 */
 static const int spla_a[16] = { 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1, 2, 3 };    /* A0-A15 */
-typedef struct { uint8_t latch; int32_t ma_cache, a_cache; } superpla_state_t;
+typedef struct { uint8_t latch; int32_t ma_cache, a_cache, pla_cache, io_cache; } superpla_state_t;
 
 /* The PLA's inputs, in the 82S100's order (pla_in_pin): VA12/VA13 are
  * MA4/MA5, PI_AEC is AEC inverted. */
@@ -963,20 +1128,28 @@ static void superpla_eval(sim_t *s, part_t *p) {
     bool cpu = pin_in(s, p, SPLA_AEC);
     unsigned a = part_read_bus(s, p, spla_a, 16);
     unsigned out = pla_logic(superpla_read_inputs(s, p));
-    static const int pla_outs[][2] = { { SPLA_ROMH, PO_ROMH }, { SPLA_ROML, PO_ROML }, { SPLA_CHARROM, PO_CHAROM },
-                                       { SPLA_KERNAL, PO_KERNAL }, { SPLA_BASIC, PO_BASIC }, { SPLA_CASRAM, PO_CASRAM } };
-    for (int i = 0; i < 6; i++) pin_out(s, p, pla_outs[i][0], DRV_BIT((out >> pla_outs[i][1]) & 1));
+    if (st->pla_cache != (int32_t)out + 1) {
+        st->pla_cache = (int32_t)out + 1;
+        static const int pla_outs[][2] = { { SPLA_ROMH, PO_ROMH }, { SPLA_ROML, PO_ROML }, { SPLA_CHARROM, PO_CHAROM },
+                                           { SPLA_KERNAL, PO_KERNAL }, { SPLA_BASIC, PO_BASIC }, { SPLA_CASRAM, PO_CASRAM } };
+        for (int i = 0; i < 6; i++) pin_out(s, p, pla_outs[i][0], DRV_BIT((out >> pla_outs[i][1]) & 1));
+    }
     /* The I/O decoder. */
-    bool y1[4] = { true, true, true, true }, y2[4] = { true, true, true, true };
-    if (!((out >> PO_IO) & 1)) y1[a >> 10 & 3] = false;
-    if (!y1[3]) y2[a >> 8 & 3] = false;
-    pin_out(s, p, SPLA_VIC, DRV_BIT(y1[0]));
-    pin_out(s, p, SPLA_SID, DRV_BIT(y1[1]));
-    pin_out(s, p, SPLA_COLRAM, DRV_BIT(y1[2] && cpu));
-    pin_out(s, p, SPLA_CIA1, DRV_BIT(y2[0]));
-    pin_out(s, p, SPLA_CIA2, DRV_BIT(y2[1]));
-    pin_out(s, p, SPLA_IO1, DRV_BIT(y2[2]));
-    pin_out(s, p, SPLA_IO2, DRV_BIT(y2[3]));
+    bool io_sel = !((out >> PO_IO) & 1);
+    int32_t io_key = (io_sel ? (int32_t)((a >> 8) & 15) + 2 : 1) | ((int32_t)cpu << 5);
+    if (st->io_cache != io_key) {
+        st->io_cache = io_key;
+        bool y1[4] = { true, true, true, true }, y2[4] = { true, true, true, true };
+        if (io_sel) y1[a >> 10 & 3] = false;
+        if (!y1[3]) y2[a >> 8 & 3] = false;
+        pin_out(s, p, SPLA_VIC, DRV_BIT(y1[0]));
+        pin_out(s, p, SPLA_SID, DRV_BIT(y1[1]));
+        pin_out(s, p, SPLA_COLRAM, DRV_BIT(y1[2] && cpu));
+        pin_out(s, p, SPLA_CIA1, DRV_BIT(y2[0]));
+        pin_out(s, p, SPLA_CIA2, DRV_BIT(y2[1]));
+        pin_out(s, p, SPLA_IO1, DRV_BIT(y2[2]));
+        pin_out(s, p, SPLA_IO2, DRV_BIT(y2[3]));
+    }
     pin_out(s, p, SPLA_RAMRW, DRV_BIT(!cpu || pin_in(s, p, SPLA_RW)));
     pin_out(s, p, SPLA_NMI, DRV_BIT(pin_in(s, p, SPLA_RESTORE)));
     /* The RAM address: the CPU's row or column, or in VIC cycles MA6/MA7
