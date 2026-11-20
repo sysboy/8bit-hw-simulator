@@ -199,13 +199,13 @@ static void zx_step(board_t *b) {
     zx48_t *z = ZX(b);
     sim_t *s = &b->sim;
     ula_step(s, &s->parts[z->p_ula]);
-    if (contention_log) {
+    if (__builtin_expect(contention_log, 0)) {
         static bool irq_prev;
         bool irq = ((ula_state_t *)s->parts[z->p_ula].state)->irq;
         frame_step = irq && !irq_prev ? 0 : frame_step + 1;
         irq_prev = irq;
     }
-    if (s->qhead != s->qtail || s->nnoisy) {
+    if (s->qhead != s->qtail || __builtin_expect(s->nnoisy != 0, 0)) {
         sim_settle(s);
         int clk = sim_read(s, z->pin_clk);
         if (clk != z->clk) {
@@ -222,7 +222,7 @@ static void zx_step(board_t *b) {
         }
     }
     board_sample(b);
-    if (ula_log_file && s->cycle >= ula_log_from) {
+    if (__builtin_expect(ula_log_file != NULL, 0) && s->cycle >= ula_log_from) {
         char line[160];
         ula_log(s->parts[z->p_ula].state, ula_log_step++, line, sizeof(line));
         fprintf(ula_log_file, "%s\n", line);
@@ -973,16 +973,22 @@ static void zx_create(board_t *b) {
         z->pin_kb_line[l] = pin_on_net(b, "KB1", net);
     }
     zx_init_keymap(z);
-    /* Buses, for the bus bitmap (speed only). */
+    /* Buses, for the bus bitmap (speed only). The 4116s receive LA0-LA6 on
+     * their A0-A6 pins in the order LA2, LA0, LA6, LA4, LA1, LA5, LA3. */
     char name[32];
     int bit = 0;
     static const struct { const char *fmt; int n; } buses[] = {
-        { "A%d", 16 }, { "D%d", 8 }, { "LA%d", 7 }, { "UA%d", 8 }, { "Net-(IC1-D%d)", 8 } };
+        { "A%d", 16 }, { "D%d", 8 }, { "UA%d", 8 }, { "Net-(IC1-D%d)", 8 } };
     for (size_t k = 0; k < sizeof(buses) / sizeof(buses[0]); k++)
         for (int i = 0; i < buses[k].n; i++) {
             snprintf(name, sizeof(name), buses[k].fmt, i);
             sim_set_bus_bit(s, sim_find_net(s, name), bit++);
         }
+    static const int la_order[7] = { 2, 0, 6, 4, 1, 5, 3 };
+    for (int i = 0; i < 7; i++) {
+        snprintf(name, sizeof(name), "LA%d", la_order[i]);
+        sim_set_bus_bit(s, sim_find_net(s, name), bit++);
+    }
     /* Power, reset, the RESET button (edge connector /RESET to GND). */
     z->pin_9v = pin_on_net(b, V(b)->power_in, "+9V");
     z->pin_12v = pin_on_net(b, "D15", "+12V");
@@ -1388,6 +1394,8 @@ static void zx_sync_epoch(board_t *b) {
     }
 }
 
+typedef struct { rom_state_t rom; uint16_t addr; uint8_t ce_prev; } zx_rom23128_state_t;
+
 static void zx_sync_to_netlist(board_t *b) {
     zx48_t *z = ZX(b);
     sim_t *s = &b->sim;
@@ -1412,7 +1420,7 @@ static void zx_sync_to_netlist(board_t *b) {
     bool lram_rd = lram_act && rd;
     bool uram_act = mreq && (rd || wr) && a >= 0x8000 && !z->ram16k && z->uram_part[0] >= 0;
     bool uram_rd = uram_act && rd;
-    rom23128_state_t *rom_st = s->parts[z->p_rom].state;
+    zx_rom23128_state_t *rom_st = s->parts[z->p_rom].state;
     rom_st->addr = a & 0x3FFF;
     rom_st->ce_prev = !mreq;
     uint8_t lv = lram_rd ? z->fast_ram[a] : 0, uv = uram_rd ? z->fast_ram[a] : 0;
