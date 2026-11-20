@@ -537,23 +537,29 @@ drive_t sim_drive_except(sim_t *s, int pin_on_net, int except_pin) {
 static void group_setup(sim_t *s, part_t *p, group_t *g, const int *numbers, int n) {
     g->epoch = s->epoch;
     g->first = -1;
+    g->fast_roots = 0;
     g->mask = g->ttl = 0;
     int first = -1;
+    bool consecutive = true;
     for (int i = 0; i < n; i++) {
         int pi = p->pinmap[numbers[i]];
         if (pi < 0) return;
         const pin_t *pin = &s->pins[pi];
         if (pin->fault == PF_OPEN || pin->root < 0) return;
+        if (n <= 16) g->roots[i] = pin->root;
         int bit = s->nets[pin->net].busbit;
-        if (bit < 0 || (i > 0 && bit != first + i)) return;
+        if (bit < 0 || (i > 0 && bit != first + i)) consecutive = false;
         if (i == 0) first = bit;
         if (pin->flags & PIN_TTL) g->ttl |= 1ULL << i;
     }
-    g->first = first;
-    g->mask = n == 64 ? ~0ULL : (1ULL << n) - 1;
+    if (n <= 16) g->fast_roots = 1;
+    if (consecutive) {
+        g->first = first;
+        g->mask = n == 64 ? ~0ULL : (1ULL << n) - 1;
+    }
 }
 
-unsigned sim_read_group(sim_t *s, part_t *p, const int *numbers, int n) {
+unsigned sim_read_group_slow(sim_t *s, part_t *p, const int *numbers, int n) {
     group_t *g = NULL;
     for (int i = 0; i < PART_GROUPS; i++) {
         group_t *c = &p->groups[i];
@@ -567,6 +573,16 @@ unsigned sim_read_group(sim_t *s, part_t *p, const int *numbers, int n) {
         uint64_t level = s->bus_level >> g->first, floating = s->bus_float >> g->first;
         if (!((s->bus_erratic >> g->first) & g->mask & ~g->ttl))
             return (unsigned)((level & g->mask) | (floating & g->ttl));
+    }
+    if (g && g->fast_roots) {
+        unsigned v = 0, erratic = 0;
+        for (int i = 0; i < n; i++) {
+            uint8_t r = s->nread[g->roots[i]];
+            int ttl = (int)((g->ttl >> i) & 1);
+            erratic |= (r & 4) & ~ttl;
+            v |= (unsigned)((r & 1) | ((r >> 1) & ttl)) << i;
+        }
+        if (__builtin_expect(!erratic, 1)) return v;
     }
     unsigned v = 0;
     for (int i = 0; i < n; i++) v |= (unsigned)pin_in(s, p, numbers[i]) << i;
