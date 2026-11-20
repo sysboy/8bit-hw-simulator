@@ -311,8 +311,21 @@ unsigned sim_read_group(sim_t *s, part_t *p, const int *numbers, int n);
  * one drive d): the strongest wins, equal ones fighting produce a
  * contention where low wins. A drive_t orders by strength first, so the
  * strongest drive present is the highest bit: no need to scan the
- * strengths one by one, whatever drives the net. */
+ * strengths one by one, whatever drives the net.
+ * A 1024-entry lookup table is used for the common domain (kinds < 1024). */
+typedef struct {
+    uint8_t drive;
+    uint8_t contention;
+} sim_combine_lut_t;
+
+extern const sim_combine_lut_t sim_combine_table[1024];
+
 static inline drive_t sim_combine(unsigned kinds, int *contention) {
+    if (__builtin_expect(kinds < 1024, 1)) {
+        sim_combine_lut_t e = sim_combine_table[kinds];
+        *contention = e.contention;
+        return e.drive;
+    }
     if (!kinds) { *contention = 0; return DRV_Z; }
     int st = (31 - __builtin_clz(kinds)) >> 1;
     unsigned lo = 1u << DRIVE(st, 0), both = lo | lo << 1;
