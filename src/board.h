@@ -248,6 +248,7 @@ const file_kind_t *board_state_file_kind(const char *path, char *info, int len, 
  * a part drives. */
 void board_rebuild(board_t *b);
 void board_run(board_t *b, int cycles);
+bool board_edges_active(const board_t *b);
 /* For the machines: after every bus step, the scope and the statistics. */
 void board_sample_slow(board_t *b);
 static inline void board_sample(board_t *b) {

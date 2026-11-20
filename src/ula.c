@@ -141,7 +141,7 @@ static void ula_eval(sim_t *s, part_t *p) {
     u->dlow = low;      /* only for ula_log() */
 }
 
-static const uint32_t ula_palette[16] = {
+const uint32_t ula_palette[16] = {
     0xFF000000u, 0xFFD70000u, 0xFF0000D7u, 0xFFD700D7u,
     0xFF00D700u, 0xFFD7D700u, 0xFF00D7D7u, 0xFFD7D7D7u,
     0xFF000000u, 0xFFFF0000u, 0xFF0000FFu, 0xFFFF00FFu,
@@ -182,16 +182,15 @@ void ula_step(sim_t *s, part_t *p) {
     ula_state_t *u = p->state;
     if (p->dead || !u->running) return;
     /* Time. */
-    unsigned h = (u->half + 1) & 3;
-    u->half = (uint8_t)h;
-    if (h == 0) {
+    u->half = (u->half + 1) & 3;
+    if (u->half == 0) {
         if (++u->c == ULA_TICKS_PER_LINE) {
             u->c = 0;
             if (++u->v == ULA_LINES) { u->v = 0; u->frames++; }
         }
         put_pixel(u);
     }
-    unsigned c = u->c, blk = c & 15;
+    unsigned c = u->c, h = u->half, blk = c & 15;
     bool screen = on_screen(u);
     /* Inputs, as the board settled them in ula_eval(). */
     bool mreq = u->in_mreq, iorq = u->in_iorq;

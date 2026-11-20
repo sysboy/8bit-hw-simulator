@@ -50,6 +50,7 @@ typedef struct {
 } ula_state_t;
 
 extern const part_type_t PT_ULA;
+extern const uint32_t ula_palette[16];
 /* One half period of the 14 MHz oscillator (8 per CPU T-state). The part
  * is marked dirty when its outputs change. */
 void ula_step(sim_t *s, part_t *p);

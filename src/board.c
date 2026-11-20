@@ -117,6 +117,8 @@ bool board_step_hook(board_t *b, board_step_fn fn, void *ctx) {
     return true;
 }
 
+bool board_edges_active(const board_t *b) { return edges.b == b; }
+
 void board_sample_slow(board_t *b) {
     sim_t *s = &b->sim;
     if (b->scope_pin >= 0) {
@@ -124,8 +126,9 @@ void board_sample_slow(board_t *b) {
         b->scope[at] = scope_sample(s, b->scope_pin);
         if (b->scope_pin2 >= 0) b->scope2[at] = scope_sample(s, b->scope_pin2);
         if (--b->st_countdown > 0) return;
+    } else if (b->st_countdown > 0 && --b->st_countdown > 0) {
+        return;
     }
-    /* Logic probe statistics: sample every net once in a while. */
     if (edges.b == b) {         /* measured: here at every step (see edges) */
         count_edges(s);
         b->st_countdown = 1;
