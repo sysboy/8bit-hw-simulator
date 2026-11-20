@@ -373,56 +373,83 @@ const part_type_t PT_4164 = { "4164",
 /* TTL glue                                                                  */
 /* ------------------------------------------------------------------------ */
 
+typedef struct { uint8_t cache[4]; } quad_gate_state_t;
+typedef struct { uint8_t cache[6]; } hex_inv_state_t;
+typedef struct { int16_t cache[2]; } ls139_state_t;
+typedef struct { int32_t cache; } ttl_mux_state_t;
+
 /* 74LS08: quad 2-input AND. */
 static void ls08_eval(sim_t *s, part_t *p) {
     static const int g[4][3] = { {1, 2, 3}, {4, 5, 6}, {9, 10, 8}, {12, 13, 11} };
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, g[i][2], DRV_BIT(pin_in(s, p, g[i][0]) && pin_in(s, p, g[i][1])));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        int in1 = pin_in(s, p, g[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][2], DRV_BIT(in0 && in1));
+    }
 }
 const part_type_t PT_74LS08 = { "74LS08",
     "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P",
-    ls08_eval, 0, 0, 0, TECH_TTL };
+    ls08_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 
 /* 7406: hex inverter with open collector outputs: it can only pull low. */
 static void ls06_eval(sim_t *s, part_t *p) {
     static const int g[6][2] = { {1, 2}, {3, 4}, {5, 6}, {9, 8}, {11, 10}, {13, 12} };
-    for (int i = 0; i < 6; i++)
-        pin_out(s, p, g[i][1], pin_in(s, p, g[i][0]) ? DRV_LO : DRV_Z);
+    hex_inv_state_t *st = p->state;
+    for (int i = 0; i < 6; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        uint8_t key = (uint8_t)(in0 + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][1], in0 ? DRV_LO : DRV_Z);
+    }
 }
 const part_type_t PT_7406 = { "7406",
     "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P",
-    ls06_eval, 0, 0, 0, TECH_TTL_OC };
+    ls06_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL_OC };
 
 /* 74LS139: dual 2-to-4 decoder, active low outputs. */
 static void ls139_eval(sim_t *s, part_t *p) {
     static const int half[2][7] = { {1, 2, 3, 4, 5, 6, 7}, {15, 14, 13, 12, 11, 10, 9} };
+    ls139_state_t *st = p->state;
     for (int h = 0; h < 2; h++) {
         const int *pin = half[h];
         bool enabled = !pin_in(s, p, pin[0]);
-        int sel = pin_in(s, p, pin[1]) | (pin_in(s, p, pin[2]) << 1);
+        int sel = enabled ? (pin_in(s, p, pin[1]) | (pin_in(s, p, pin[2]) << 1)) : -1;
+        int16_t key = (int16_t)(sel + 2);
+        if (st->cache[h] == key) continue;
+        st->cache[h] = key;
         for (int y = 0; y < 4; y++) pin_out(s, p, pin[3 + y], DRV_BIT(!(enabled && sel == y)));
     }
 }
 const part_type_t PT_74LS139 = { "74LS139",
     "1/G:T 1A:T 1B:T 1Y0:O 1Y1:O 1Y2:O 1Y3:O GND:P 2Y3:O 2Y2:O 2Y1:O 2Y0:O 2B:T 2A:T "
-    "2/G:T VCC:P", ls139_eval, 0, 0, 0, TECH_TTL };
+    "2/G:T VCC:P", ls139_eval, 0, 0, sizeof(ls139_state_t), TECH_TTL };
 
 /* 74LS257 / 74LS258: quad 2-to-1 multiplexer (258 has inverted outputs).
  * S low selects the A inputs, S high selects B. /G high: outputs off. */
 static void mux_eval(sim_t *s, part_t *p, bool invert) {
     static const int sec[4][3] = { {2, 3, 4}, {5, 6, 7}, {11, 10, 9}, {14, 13, 12} };
     static const int outputs[4] = { 4, 7, 9, 12 };
+    ttl_mux_state_t *st = p->state;
     bool enabled = !pin_in(s, p, 15);
+    if (!enabled) {
+        part_drive_bus_cached(s, p, outputs, 4, 0, false, &st->cache);
+        return;
+    }
     int sel = pin_in(s, p, 1);
     unsigned v = 0;
     for (int i = 0; i < 4; i++) v |= (unsigned)(pin_in(s, p, sel ? sec[i][1] : sec[i][0]) ^ invert) << i;
-    part_drive_bus(s, p, outputs, 4, v, enabled);
+    part_drive_bus_cached(s, p, outputs, 4, v, true, &st->cache);
 }
 static void ls257_eval(sim_t *s, part_t *p) { mux_eval(s, p, false); }
 static void ls258_eval(sim_t *s, part_t *p) { mux_eval(s, p, true); }
 #define MUX_PINS "S:T 1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3B:T 3A:T 4Y:O 4B:T 4A:T /G:T VCC:P"
-const part_type_t PT_74LS257 = { "74LS257", MUX_PINS, ls257_eval, 0, 0, 0, TECH_TTL };
-const part_type_t PT_74LS258 = { "74LS258", MUX_PINS, ls258_eval, 0, 0, 0, TECH_TTL };
+const part_type_t PT_74LS257 = { "74LS257", MUX_PINS, ls257_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
+const part_type_t PT_74LS258 = { "74LS258", MUX_PINS, ls258_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
 
 /* 74LS373: octal transparent latch. While LE is high the outputs follow the
  * inputs; when LE goes low the last value is held. /OE high: outputs off. */
@@ -732,35 +759,70 @@ const part_type_t PT_HN613128 = { "HN613128 ROM", ROM23128_PINS("CS", "OE0", "OE
  * /G high the outputs are low (not off, unlike the 74LS257). */
 static void ls157_eval(sim_t *s, part_t *p) {
     static const int sec[4][3] = { {2, 3, 4}, {5, 6, 7}, {11, 10, 9}, {14, 13, 12} };
+    static const int outputs[4] = { 4, 7, 9, 12 };
+    ttl_mux_state_t *st = p->state;
     bool enabled = !pin_in(s, p, 15);
+    if (!enabled) {
+        if (st->cache == 1) return;
+        st->cache = 1;
+        for (int i = 0; i < 4; i++) pin_out(s, p, outputs[i], DRV_LO);
+        return;
+    }
     int sel = pin_in(s, p, 1);
+    unsigned v = 0;
     for (int i = 0; i < 4; i++)
-        pin_out(s, p, sec[i][2], DRV_BIT(enabled && pin_in(s, p, sel ? sec[i][1] : sec[i][0])));
+        v |= (unsigned)pin_in(s, p, sel ? sec[i][1] : sec[i][0]) << i;
+    int32_t key = (int32_t)v + 2;
+    if (st->cache == key) return;
+    st->cache = key;
+    for (int i = 0; i < 4; i++)
+        pin_out(s, p, outputs[i], DRV_BIT((v >> i) & 1));
 }
-const part_type_t PT_74LS157 = { "74LS157", MUX_PINS, ls157_eval, 0, 0, 0, TECH_TTL };
+const part_type_t PT_74LS157 = { "74LS157", MUX_PINS, ls157_eval, 0, 0, sizeof(ttl_mux_state_t), TECH_TTL };
 
 /* 74LS32: quad 2-input OR. 74LS00: quad 2-input NAND. */
 static const int quad_gates[4][3] = { {1, 2, 3}, {4, 5, 6}, {9, 10, 8}, {12, 13, 11} };
 static void ls32_eval(sim_t *s, part_t *p) {
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, quad_gates[i][2], DRV_BIT(pin_in(s, p, quad_gates[i][0]) || pin_in(s, p, quad_gates[i][1])));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, quad_gates[i][0]);
+        int in1 = pin_in(s, p, quad_gates[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, quad_gates[i][2], DRV_BIT(in0 || in1));
+    }
 }
 static void ls00_eval(sim_t *s, part_t *p) {
-    for (int i = 0; i < 4; i++)
-        pin_out(s, p, quad_gates[i][2], DRV_BIT(!(pin_in(s, p, quad_gates[i][0]) && pin_in(s, p, quad_gates[i][1]))));
+    quad_gate_state_t *st = p->state;
+    for (int i = 0; i < 4; i++) {
+        int in0 = pin_in(s, p, quad_gates[i][0]);
+        int in1 = pin_in(s, p, quad_gates[i][1]);
+        uint8_t key = (uint8_t)(((in0 << 1) | in1) + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, quad_gates[i][2], DRV_BIT(!(in0 && in1)));
+    }
 }
 const part_type_t PT_74LS32 = { "74LS32",
-    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls32_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls32_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 const part_type_t PT_74LS00 = { "74LS00",
-    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls00_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1B:T 1Y:O 2A:T 2B:T 2Y:O GND:P 3Y:O 3A:T 3B:T 4Y:O 4A:T 4B:T VCC:P", ls00_eval, 0, 0, sizeof(quad_gate_state_t), TECH_TTL };
 
 /* 74LS04: hex inverter. */
 static void ls04_eval(sim_t *s, part_t *p) {
     static const int g[6][2] = { {1, 2}, {3, 4}, {5, 6}, {9, 8}, {11, 10}, {13, 12} };
-    for (int i = 0; i < 6; i++) pin_out(s, p, g[i][1], DRV_BIT(!pin_in(s, p, g[i][0])));
+    hex_inv_state_t *st = p->state;
+    for (int i = 0; i < 6; i++) {
+        int in0 = pin_in(s, p, g[i][0]);
+        uint8_t key = (uint8_t)(in0 + 1);
+        if (st->cache[i] == key) continue;
+        st->cache[i] = key;
+        pin_out(s, p, g[i][1], DRV_BIT(!in0));
+    }
 }
 const part_type_t PT_74LS04 = { "74LS04",
-    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL };
 
 /* ZX8401 (Philips PCF1306P): the Issue 6A's glue in one chip, the 4B's
  * IC3, IC4 and IC23-IC26 as a drop-in replacement made of 74LS parts
@@ -885,7 +947,7 @@ const part_type_t PT_27128 = { "27128 EPROM",
 /* 74LS14: hex Schmitt trigger inverter (the analog side of its inputs,
  * the reset RC and the mains, is not simulated: see c64.c). */
 const part_type_t PT_74LS14 = { "74LS14",
-    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, 0, TECH_TTL };
+    "1A:T 1Y:O 2A:T 2Y:O 3A:T 3Y:O GND:P 4Y:O 4A:T 5Y:O 5A:T 6Y:O 6A:T VCC:P", ls04_eval, 0, 0, sizeof(hex_inv_state_t), TECH_TTL };
 
 /* MOS 8701 clock generator (U20): with the crystal Y1 it makes the color
  * clock (pin 8) and, divided down, the dot clock (pin 6) for the VIC.
