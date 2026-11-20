@@ -588,12 +588,71 @@ const part_type_t PT_MC4044 = { "MC4044 PLL",
 /* What a series resistor passes from one side to the other: the drive on
  * that side (its own drive excluded), one step weaker. Through two
  * resistors a chip output is only as strong as a pull-up. */
+static inline drive_t through_fast(const net_t *n, drive_t eff) {
+    unsigned kinds = n->kinds;
+    if (kinds >= (1u << DRIVE(S_STRONG, 0)) && kinds < (1u << DRIVE(S_SUPPLY, 0)) && eff < DRIVE(S_STRONG, 0))
+        return DRIVE(S_RES, !(kinds & (1u << DRIVE(S_STRONG, 0))));
+    if ((eff >> 1) && n->count[eff] == 1) kinds &= ~(1u << eff);
+    if (!kinds) return DRV_Z;
+    int st = (31 - __builtin_clz(kinds)) >> 1;
+    return DRIVE(st >= S_STRONG ? S_RES : S_PULL, !(kinds & (1u << DRIVE(st, 0))));
+}
+
 static drive_t through(sim_t *s, int pin) {
-    drive_t d = sim_drive_others(s, pin);
-    int st = d >> 1;
-    if (st >= S_STRONG) return DRIVE(S_RES, d & 1);
-    if (st >= S_PULL) return DRIVE(S_PULL, d & 1);
-    return DRV_Z;
+    const pin_t *p = &s->pins[pin];
+    if (p->root < 0 || p->fault == PF_OPEN) return DRV_Z;
+    return through_fast(&s->nets[p->root], p->eff);
+}
+
+static void series_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    if (__builtin_expect(st->epoch != s->epoch, 0)) {
+        st->epoch = s->epoch;
+        st->off = p->rfault != RF_OK || a->root < 0 || b->root < 0 || a->root == b->root ||
+                  a->fault == PF_OPEN || b->fault == PF_OPEN;
+    }
+    if (__builtin_expect(st->off, 0)) {
+        sim_drive(s, e->pin_b, DRV_Z);
+        sim_drive(s, e->pin_a, DRV_Z);
+        return;
+    }
+    drive_t da = through_fast(&s->nets[a->root], a->eff);
+    drive_t db = through_fast(&s->nets[b->root], b->eff);
+    sim_drive(s, e->pin_b, da);
+    sim_drive(s, e->pin_a, db);
+}
+
+static void diode_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *k = &s->pins[e->pin_b];
+    bool on = p->rfault == RF_OK && k->root >= 0 && k->fault != PF_OPEN &&
+              s->nets[k->root].strength != S_Z && !s->nets[k->root].level;
+    if (__builtin_expect(p->rfault == RF_SHORT, 0)) on = k->root >= 0 && !s->nets[k->root].level;
+    sim_drive(s, e->pin_a, on ? DRIVE(S_RES, 0) : DRV_Z);
+}
+
+static void delay_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    sim_drive(s, st->el[0].pin_b, p->rfault != RF_OK ? DRV_Z : DRV_BIT(st->delayed[0]));
+}
+
+static void delay_commit(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    uint8_t v = (uint8_t)sim_read(s, st->el[0].pin_a);
+    if (v != st->delayed[0]) { st->delayed[0] = v; sim_mark_dirty(s, (int)(p - s->parts)); }
+}
+
+static void transistor_eval(sim_t *s, part_t *p) {
+    resistor_state_t *st = p->state;
+    const element_t *e = &st->el[0];
+    const pin_t *bp = &s->pins[e->pin_a];
+    bool on = p->rfault == RF_SHORT ||
+              (p->rfault == RF_OK && bp->root >= 0 && bp->fault != PF_OPEN &&
+               s->nets[bp->root].strength != S_Z && s->nets[bp->root].level);
+    sim_drive(s, e->pin_b, !on ? DRV_Z : e->type == EL_NPN ? DRV_LO : DRV_HI);
 }
 
 void resistor_eval(sim_t *s, part_t *p) {
@@ -667,26 +726,31 @@ void element_set_type(sim_t *s, part_t *p, int index, int type) {
     element_t *e = &st->el[index];
     e->type = type;
     pin_t *a = &s->pins[e->pin_a], *b = &s->pins[e->pin_b];
+    bool single = st->nel == 1 && index == 0;
+    p->eval = resistor_eval;
     switch (type) {
     case EL_SERIES:     /* re-evaluated when anything on either side changes */
         a->flags = b->flags = PIN_SENSE | PIN_SWITCH | PIN_IN | PIN_OUT;
+        if (single) p->eval = series_eval;
         break;
     case EL_DIODE:
         a->flags = PIN_OUT;
         b->flags = PIN_SENSE | PIN_IN;
+        if (single) p->eval = diode_eval;
         break;
     case EL_NPN:
     case EL_FOLLOWER:
         a->flags = PIN_SENSE | PIN_IN;
         b->flags = PIN_OUT;
+        if (single) p->eval = transistor_eval;
         break;
     case EL_DELAY:
         a->flags = PIN_IN;
         b->flags = PIN_OUT;
-        p->commit = resistor_commit;
+        p->eval = single ? delay_eval : resistor_eval;
+        p->commit = single ? delay_commit : resistor_commit;
         break;
     }
-    p->eval = resistor_eval;
 }
 
 /* ------------------------------------------------------------------------ */
