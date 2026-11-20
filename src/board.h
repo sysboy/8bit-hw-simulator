@@ -249,7 +249,11 @@ const file_kind_t *board_state_file_kind(const char *path, char *info, int len, 
 void board_rebuild(board_t *b);
 void board_run(board_t *b, int cycles);
 /* For the machines: after every bus step, the scope and the statistics. */
-void board_sample(board_t *b);
+void board_sample_slow(board_t *b);
+static inline void board_sample(board_t *b) {
+    if (__builtin_expect(b->scope_pin < 0 && --b->st_countdown > 0, 1)) return;
+    board_sample_slow(b);
+}
 
 /* Faults. Every change rebuilds the electrical network. */
 void board_set_pin_fault(board_t *b, int pin, int fault);

@@ -46,6 +46,7 @@ typedef struct {
     uint32_t inputs;
     uint8_t pix;                    /* the colour of the last pixel (bit 3 bright) */
     int32_t addr_cache, data_cache;
+    bool in_mreq, in_iorq, in_rd, in_wr, in_a14, in_a15;
 } ula_state_t;
 
 extern const part_type_t PT_ULA;
